@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "luma-optimizer"
+version = "0.1.0"
+description = "LUMA: Log-space Unbiased Momentum Adam — memory-efficient drop-in replacement for AdamW"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=3.0"]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
