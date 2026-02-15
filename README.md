@@ -1,4 +1,4 @@
-# LUMA — Log-space Unbiased Momentum Adam
+# LUMA — Log-space Unbiased Momentum AdamW
 
 Memory-efficient drop-in replacement for AdamW that compresses optimizer states to **4 bytes/param** (vs 8 bytes/param in AdamW) via preconditioner-domain quantization with unbiased log-to-linear stochastic rounding.
 
@@ -41,6 +41,16 @@ Key ideas:
 | PyTorch (reference) | CPU / CUDA | `backend="pytorch"` |
 | Triton (fused, zero temp alloc) | CUDA | `backend="triton"` |
 | Auto | best available | `backend="auto"` (default) |
+
+## Distributed training
+
+LUMA is a standard `torch.optim.Optimizer` and works out of the box with common distributed setups:
+
+| Setup | Compatible | Notes |
+|---|---|---|
+| **DDP** (`DistributedDataParallel`) | Yes | No special configuration needed — each rank runs its own LUMA instance. |
+| **FSDP** (`FullyShardedDataParallel`) | Yes | Scales `S_m` / `S_v` are computed per-shard, which is correct by design. Checkpointing via `FSDP.state_dict()` works as usual. |
+| **GradScaler** (AMP) | Yes | LUMA internally promotes gradients to float32, so fp16/bf16 inputs are handled correctly. Use `GradScaler` with `unscale_()` before `step()` as normal. |
 
 ## Tests
 

@@ -118,15 +118,21 @@ def _decode_preconditioner(
 
 def _quantize_momentum(
     m: Tensor,
-    S_m_old: float,
+    S_m: float,
     delta_m: float,
     z_m: float,
+    *,
+    out: Tensor | None = None,
 ) -> Tensor:
-    m_clip = m.clamp(-S_m_old, S_m_old)
+    m_clip = m.clamp(-S_m, S_m)
     y = torch.log1p(m_clip.abs()) / delta_m
     rand = torch.rand_like(y)
     q_mag = _log_sr(y, delta_m, z_m, rand, K_M)
-    return (m_clip.sign() * q_mag).to(torch.int16)
+    q = (m_clip.sign() * q_mag).to(torch.int16)
+    if out is not None:
+        out.copy_(q)
+        return out
+    return q
 
 
 def _quantize_preconditioner(
@@ -135,6 +141,8 @@ def _quantize_preconditioner(
     w_min: float,
     delta_w: float,
     z_w: float,
+    *,
+    out: Tensor | None = None,
 ) -> Tensor:
     w = 1.0 / (v.sqrt() + eps)
     w_max = 1.0 / (2.0 * eps)
@@ -145,7 +153,11 @@ def _quantize_preconditioner(
         y = torch.zeros_like(w_clip)
     rand = torch.rand_like(y)
     q = _log_sr(y, delta_w, z_w, rand, K_W)
-    return _encode_uint16(q.to(torch.int32))
+    q_int = _encode_uint16(q.to(torch.int32))
+    if out is not None:
+        out.copy_(q_int)
+        return out
+    return q_int
 
 
 # ===================================================================== #
@@ -211,7 +223,7 @@ def luma_update_step(
     eps: float,
     lr: float,
     weight_decay: float,
-) -> tuple[Tensor, Tensor, float, float]:
+) -> tuple[float, float]:
     """Steps >= 2 — decode → update → re-quantise (matched scales).
 
     Two-pass approach: compute new scales first, then quantise on the
@@ -221,7 +233,8 @@ def luma_update_step(
     All intermediate arithmetic is promoted to float32 so that bf16 / fp16
     parameters and gradients are handled correctly.
 
-    Returns ``(Q_m_new, Q_w_new, S_m_next, S_v_next)``.
+    Modifies *param*, *Q_m*, *Q_w* **in-place**.
+    Returns ``(S_m_next, S_v_next)``.
     """
     # ── promote to float32 for numerical stability (bf16/fp16 safe) ─────
     grad_fp32 = grad.float()
@@ -251,14 +264,14 @@ def luma_update_step(
     S_m_next: float = max(m_new.abs().max().item(), SCALE_FLOOR_M)
     S_v_next: float = max(v_new.max().item(), eps * eps)
 
-    # ── 4. re-quantise with NEW matched scales ──────────────────────────
+    # ── 4. re-quantise with NEW matched scales (in-place) ───────────────
     #   Two-pass: we already know S_m_next/S_v_next, so we build the NEW
     #   grid and quantise on it.  At the next step decode uses the same
     #   grid → exact encode-decode match, zero systematic drift.
     w_min_new, delta_m_new, z_m_new, delta_w_new, z_w_new = _precompute(
         S_m_next, S_v_next, eps,
     )
-    Q_m_new = _quantize_momentum(m_new, S_m_next, delta_m_new, z_m_new)
-    Q_w_new = _quantize_preconditioner(v_new, eps, w_min_new, delta_w_new, z_w_new)
+    _quantize_momentum(m_new, S_m_next, delta_m_new, z_m_new, out=Q_m)
+    _quantize_preconditioner(v_new, eps, w_min_new, delta_w_new, z_w_new, out=Q_w)
 
-    return Q_m_new, Q_w_new, S_m_next, S_v_next
+    return S_m_next, S_v_next

@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from luma_optimizer import LUMA
 from luma_optimizer.functional import (
     K_M,
     K_W,
@@ -175,26 +176,24 @@ class TestTracking:
         a = torch.rand(d, device=device) + 0.5   # eigenvalues in [0.5, 1.5]
         b = torch.randn(d, device=device)
 
-        x_adam = torch.randn(d, device=device, requires_grad=True)
-        x_luma = x_adam.data.clone().requires_grad_(True)
+        x_adamw = torch.randn(d, device=device, requires_grad=True)
+        x_luma = x_adamw.data.clone().requires_grad_(True)
 
-        opt_adam = torch.optim.AdamW(
-            [x_adam], lr=1e-2, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
+        opt_adamw = torch.optim.AdamW(
+            [x_adamw], lr=1e-2, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
         )
-        from luma_optimizer import LUMA as _LUMA
-
-        opt_luma = _LUMA(
+        opt_luma = LUMA(
             [x_luma], lr=1e-2, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
         )
 
         loss_fn = lambda x: 0.5 * (a * (x - b).square()).sum()
-        init_loss = loss_fn(x_adam).item()
+        init_loss = loss_fn(x_adamw).item()
 
-        losses_adam: list[float] = []
+        losses_adamw: list[float] = []
         losses_luma: list[float] = []
         for _ in range(300):
             for opt, x, losses in [
-                (opt_adam, x_adam, losses_adam),
+                (opt_adamw, x_adamw, losses_adamw),
                 (opt_luma, x_luma, losses_luma),
             ]:
                 opt.zero_grad()
@@ -210,14 +209,14 @@ class TestTracking:
         )
 
         # ── Final loss close to AdamW (within 2×) ────────────────────
-        assert losses_luma[-1] < losses_adam[-1] * 2.0 + 1e-7, (
+        assert losses_luma[-1] < losses_adamw[-1] * 2.0 + 1e-7, (
             f"LUMA too far from AdamW on {device}: "
-            f"LUMA={losses_luma[-1]:.6g} vs AdamW={losses_adam[-1]:.6g}"
+            f"LUMA={losses_luma[-1]:.6g} vs AdamW={losses_adamw[-1]:.6g}"
         )
 
         # ── Trajectories stay close at checkpoints ───────────────────
         for step in [49, 149, 299]:
-            l_a, l_h = losses_adam[step], losses_luma[step]
+            l_a, l_h = losses_adamw[step], losses_luma[step]
             rel = abs(l_h - l_a) / max(l_a, 1e-8)
             assert rel < 0.5, (
                 f"Trajectories diverged at step {step + 1} on {device}: "
@@ -225,11 +224,11 @@ class TestTracking:
             )
 
         # ── Parameters close in L2 ───────────────────────────────────
-        param_dist = (x_luma.data - x_adam.data).norm().item()
-        param_scale = x_adam.data.norm().item()
+        param_dist = (x_luma.data - x_adamw.data).norm().item()
+        param_scale = x_adamw.data.norm().item()
         assert param_dist < 0.05 * param_scale + 1e-6, (
             f"Parameters diverged on {device}: "
-            f"||delta||={param_dist:.6f}, ||x_adam||={param_scale:.4f}"
+            f"||delta||={param_dist:.6f}, ||x_adamw||={param_scale:.4f}"
         )
 
 
@@ -243,8 +242,6 @@ class TestTritonFallbackParity:
     @staticmethod
     def _make_pair(d: int = 64):
         """Two LUMA optimisers on CUDA: one Triton, one PyTorch fallback."""
-        from luma_optimizer import LUMA
-
         x_tri = torch.randn(d, device="cuda", requires_grad=True)
         x_pt = x_tri.data.clone().requires_grad_(True)
 

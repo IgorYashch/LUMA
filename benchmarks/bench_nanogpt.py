@@ -171,22 +171,22 @@ def main():
 
     # ── identical init ───────────────────────────────────────────────
     torch.manual_seed(1337)
-    model_adam = NanoGPT(vocab_size, N_EMBD, N_HEAD, N_LAYER, BLOCK_SIZE).to(DEVICE)
+    model_adamw = NanoGPT(vocab_size, N_EMBD, N_HEAD, N_LAYER, BLOCK_SIZE).to(DEVICE)
     model_luma = NanoGPT(vocab_size, N_EMBD, N_HEAD, N_LAYER, BLOCK_SIZE).to(DEVICE)
-    model_luma.load_state_dict(model_adam.state_dict())
+    model_luma.load_state_dict(model_adamw.state_dict())
 
     # sanity check: weights are bit-exact
     for (na, pa), (nh, ph) in zip(
-        model_adam.named_parameters(), model_luma.named_parameters()
+        model_adamw.named_parameters(), model_luma.named_parameters()
     ):
         assert torch.equal(pa.data, ph.data), f"Init mismatch in {na}"
-    n_params = model_adam.count_params()
+    n_params = model_adamw.count_params()
     print(f"Model: {N_LAYER}L / {N_HEAD}H / {N_EMBD}D  —  {n_params:,} params")
     print(f"Init weights verified bit-exact ✓")
 
     # ── optimisers (create BEFORE compile) ────────────────────────────
-    opt_adam = torch.optim.AdamW(
-        model_adam.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY,
+    opt_adamw = torch.optim.AdamW(
+        model_adamw.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY,
     )
     opt_luma = LUMA(
         model_luma.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY,
@@ -195,14 +195,14 @@ def main():
     # ── torch.compile ────────────────────────────────────────────────
     if COMPILE:
         print("Compiling models (first step will be slow)...")
-        model_adam = torch.compile(model_adam)
+        model_adamw = torch.compile(model_adamw)
         model_luma = torch.compile(model_luma)
 
     # ── interleaved training (SAME batch → BOTH models) ──────────────
     torch.manual_seed(42)
-    tr_adam: dict[int, float] = {}
+    tr_adamw: dict[int, float] = {}
     tr_luma: dict[int, float] = {}
-    val_adam: dict[int, float] = {}
+    val_adamw: dict[int, float] = {}
     val_luma: dict[int, float] = {}
 
     print(f"\n{'─' * 80}")
@@ -212,11 +212,11 @@ def main():
         xb, yb = get_batch(train_data, DEVICE)       # ONE batch for BOTH
 
         # ── AdamW step ───────────────────────────────────────────────
-        _, loss_a = model_adam(xb, yb)
-        opt_adam.zero_grad(set_to_none=True)
+        _, loss_a = model_adamw(xb, yb)
+        opt_adamw.zero_grad(set_to_none=True)
         loss_a.backward()
-        torch.nn.utils.clip_grad_norm_(model_adam.parameters(), 1.0)
-        opt_adam.step()
+        torch.nn.utils.clip_grad_norm_(model_adamw.parameters(), 1.0)
+        opt_adamw.step()
 
         # ── LUMA step ────────────────────────────────────────────────
         _, loss_h = model_luma(xb, yb)
@@ -228,11 +228,11 @@ def main():
         # ── eval ─────────────────────────────────────────────────────
         if step % EVAL_EVERY == 0 or step == 1:
             ev_a, ev_h = estimate_loss_pair(
-                model_adam, model_luma, train_data, val_data, DEVICE,
+                model_adamw, model_luma, train_data, val_data, DEVICE,
             )
-            tr_adam[step] = ev_a["train"]
+            tr_adamw[step] = ev_a["train"]
             tr_luma[step] = ev_h["train"]
-            val_adam[step] = ev_a["val"]
+            val_adamw[step] = ev_a["val"]
             val_luma[step] = ev_h["val"]
 
             elapsed = time.perf_counter() - t0
@@ -248,7 +248,7 @@ def main():
             )
 
     # ── comparison table ─────────────────────────────────────────────
-    common = sorted(set(tr_adam) & set(tr_luma))
+    common = sorted(set(tr_adamw) & set(tr_luma))
     print(f"\n{'=' * 80}")
     print("  nanoGPT Shakespeare — LUMA vs AdamW  (same init, same data, torch.compile)")
     print(f"{'=' * 80}")
@@ -259,8 +259,8 @@ def main():
     )
     print("  " + "─" * 74)
     for s in common:
-        ta, th = tr_adam[s], tr_luma[s]
-        va, vh = val_adam[s], val_luma[s]
+        ta, th = tr_adamw[s], tr_luma[s]
+        va, vh = val_adamw[s], val_luma[s]
         rd_t = abs(th - ta) / max(ta, 1e-8)
         rd_v = abs(vh - va) / max(va, 1e-8)
         print(
@@ -269,10 +269,10 @@ def main():
         )
 
     last = common[-1]
-    print(f"\n  Final train: AdamW={tr_adam[last]:.4f}  LUMA={tr_luma[last]:.4f}  "
-          f"Δ={abs(tr_luma[last]-tr_adam[last])/tr_adam[last]:.4%}")
-    print(f"  Final val:   AdamW={val_adam[last]:.4f}  LUMA={val_luma[last]:.4f}  "
-          f"Δ={abs(val_luma[last]-val_adam[last])/val_adam[last]:.4%}")
+    print(f"\n  Final train: AdamW={tr_adamw[last]:.4f}  LUMA={tr_luma[last]:.4f}  "
+          f"Δ={abs(tr_luma[last]-tr_adamw[last])/tr_adamw[last]:.4%}")
+    print(f"  Final val:   AdamW={val_adamw[last]:.4f}  LUMA={val_luma[last]:.4f}  "
+          f"Δ={abs(val_luma[last]-val_adamw[last])/val_adamw[last]:.4%}")
 
     total = time.perf_counter() - t0
     print(f"\n  Total time: {total:.1f}s  ({total/STEPS*1000:.0f} ms/step)")

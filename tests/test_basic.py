@@ -79,13 +79,20 @@ class TestStepping:
             opt.step()
 
     def test_closure(self, device):
+        """step(closure) calls the closure and returns its loss."""
         model = nn.Linear(4, 2).to(device)
         opt = LUMA(model.parameters())
         x = torch.randn(2, 4, device=device)
-        opt.zero_grad()
-        loss = model(x).sum()
-        loss.backward()
-        opt.step()
+
+        def closure():
+            opt.zero_grad()
+            loss = model(x).sum()
+            loss.backward()
+            return loss
+
+        returned = opt.step(closure)
+        assert returned is not None
+        assert torch.is_tensor(returned)
 
 
 # ── state shapes & dtypes ──────────────────────────────────────────────────
