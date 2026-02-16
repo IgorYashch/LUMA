@@ -16,13 +16,7 @@ from luma_optimizer.functional import (
     _log_sr,
     _precompute,
 )
-
-# ── Triton + CUDA availability flag ─────────────────────────────────────────
-_CUDA_AND_TRITON = torch.cuda.is_available()
-try:
-    import triton  # noqa: F401
-except ImportError:
-    _CUDA_AND_TRITON = False
+from utils import requires_cuda_triton
 
 
 # ── uint16 round-trip  (CPU-only, pure integer logic) ──────────────────────
@@ -53,7 +47,7 @@ class TestLogSR:
         k_max: int,
         decode_fn,
         n_samples: int = 200_000,
-        tol: float = 0.05,
+        tol: float = 0.002,
         device: torch.device = torch.device("cpu"),
     ):
         y_scalar = decode_fn["to_y"](true_val)
@@ -65,7 +59,7 @@ class TestLogSR:
         rel_err = abs(mean - true_val) / (abs(true_val) + 1e-30)
         assert rel_err < tol, (
             f"Biased on {device}: true={true_val:.6g}, mean={mean:.6g}, "
-            f"rel_err={rel_err:.4f}"
+            f"rel_err={rel_err:.6f}"
         )
 
     @pytest.mark.parametrize("val", [0.001, 0.01, 0.1, 0.5, 0.99])
@@ -103,7 +97,7 @@ class TestLogSR:
                 "to_y": lambda v: math.log(v / w_min) / delta_w,
                 "from_q": lambda q: w_min * torch.exp(q * delta_w),
             },
-            tol=0.02,
+            tol=0.001,
             device=device,
         )
 
@@ -202,40 +196,43 @@ class TestTracking:
                 loss.backward()
                 opt.step()
 
-        # ── Strong convergence (>95% loss reduction) ──────────────────
-        assert losses_luma[-1] < init_loss * 0.05, (
+        # ── Strong convergence (>97% loss reduction) ──────────────────
+        assert losses_luma[-1] < init_loss * 0.035, (
             f"LUMA didn't converge on {device}: "
-            f"init={init_loss:.4f}, final={losses_luma[-1]:.4f}"
+            f"init={init_loss:.4f}, final={losses_luma[-1]:.4f}, "
+            f"ratio={losses_luma[-1] / init_loss:.6f}"
         )
 
-        # ── Final loss close to AdamW (within 2×) ────────────────────
-        assert losses_luma[-1] < losses_adamw[-1] * 2.0 + 1e-7, (
+        # ── Final loss close to AdamW (within 0.5%) ──────────────────
+        assert losses_luma[-1] < losses_adamw[-1] * 1.005 + 1e-7, (
             f"LUMA too far from AdamW on {device}: "
-            f"LUMA={losses_luma[-1]:.6g} vs AdamW={losses_adamw[-1]:.6g}"
+            f"LUMA={losses_luma[-1]:.6g} vs AdamW={losses_adamw[-1]:.6g}, "
+            f"ratio={losses_luma[-1] / losses_adamw[-1]:.6f}"
         )
 
         # ── Trajectories stay close at checkpoints ───────────────────
         for step in [49, 149, 299]:
             l_a, l_h = losses_adamw[step], losses_luma[step]
             rel = abs(l_h - l_a) / max(l_a, 1e-8)
-            assert rel < 0.5, (
+            assert rel < 0.005, (
                 f"Trajectories diverged at step {step + 1} on {device}: "
-                f"LUMA={l_h:.6g}, AdamW={l_a:.6g}, rel_diff={rel:.2f}"
+                f"LUMA={l_h:.6g}, AdamW={l_a:.6g}, rel_diff={rel:.6f}"
             )
 
         # ── Parameters close in L2 ───────────────────────────────────
         param_dist = (x_luma.data - x_adamw.data).norm().item()
         param_scale = x_adamw.data.norm().item()
-        assert param_dist < 0.05 * param_scale + 1e-6, (
+        assert param_dist < 0.003 * param_scale + 1e-6, (
             f"Parameters diverged on {device}: "
-            f"||delta||={param_dist:.6f}, ||x_adamw||={param_scale:.4f}"
+            f"||delta||={param_dist:.6e}, ||x_adamw||={param_scale:.4f}, "
+            f"rel={param_dist / param_scale:.6f}"
         )
 
 
 # ── Triton ↔ PyTorch fallback parity (CUDA only) ────────────────────────────
 
 
-@pytest.mark.skipif(not _CUDA_AND_TRITON, reason="Requires CUDA + Triton")
+@requires_cuda_triton
 class TestTritonFallbackParity:
     """Triton kernel and PyTorch fallback must produce near-identical results."""
 

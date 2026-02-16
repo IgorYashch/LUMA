@@ -27,7 +27,7 @@ import torch
 from torch.optim import Optimizer
 
 from . import functional as F
-from .config import get_kernel_config
+from .config import SCALE_FLOOR_M, get_kernel_config
 
 # Triton back-end is optional (CUDA-only)
 try:
@@ -159,14 +159,15 @@ class LUMA(Optimizer):
                         state[key] = state[key].to(p.device)
 
                 # Reconstruct Triton buffers if missing
+                param = self._unwrap_tensor(p)
                 if (
                     self._use_triton
-                    and p.is_cuda
+                    and param.is_cuda
                     and "_old_scalars" not in state
                     and "S_m" in state
                 ):
                     self._init_triton_buffers(
-                        state, p,
+                        state, param,
                         state["S_m"], state["S_v"],
                         beta1, beta2,
                         step=state.get("step", 1),
@@ -245,6 +246,90 @@ class LUMA(Optimizer):
         return {"state": adamw_state, "param_groups": param_groups}
 
     # ------------------------------------------------------------------
+    #  Import from AdamW
+    # ------------------------------------------------------------------
+
+    def import_adamw_state(self, adamw_sd: dict) -> None:
+        """Import optimizer state from a ``torch.optim.AdamW`` state dict.
+
+        Quantises FP32 ``exp_avg`` and ``exp_avg_sq`` tensors into LUMA's
+        int16 format, preserving the step counter so that bias-correction
+        continues seamlessly from where AdamW left off.
+
+        Usage::
+
+            adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            # ... train with AdamW ...
+            luma = LUMA(model.parameters(), lr=1e-3)
+            luma.import_adamw_state(adamw.state_dict())
+            # ... continue training with LUMA ...
+
+        Note
+        ----
+        Hyper-parameters (``lr``, ``betas``, ``eps``, ``weight_decay``) are
+        **not** imported from the AdamW state dict — set them when
+        constructing the LUMA optimiser.
+        """
+        # Build flat param list in param_group order, with group reference
+        all_params: list[torch.Tensor] = []
+        param_group_map: dict[int, dict] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                param_group_map[len(all_params)] = group
+                all_params.append(p)
+
+        self._next_param_id = 0
+
+        for idx_key, adamw_state in adamw_sd["state"].items():
+            idx = int(idx_key) if isinstance(idx_key, str) else idx_key
+            if idx >= len(all_params):
+                raise ValueError(
+                    f"AdamW state has index {idx} but LUMA only has "
+                    f"{len(all_params)} parameters"
+                )
+
+            p = all_params[idx]
+            group = param_group_map[idx]
+            eps = group["eps"]
+            beta1, beta2 = group["betas"]
+
+            # Extract step
+            step_val = adamw_state["step"]
+            step = int(
+                step_val.item() if isinstance(step_val, torch.Tensor) else step_val
+            )
+
+            # Extract FP32 states
+            param = self._unwrap_tensor(p)
+            device = param.device if param is not None else p.device
+            m = adamw_state["exp_avg"].to(device).float()
+            v = adamw_state["exp_avg_sq"].to(device).float().clamp(min=eps * eps)
+
+            # Compute delayed scales
+            S_m: float = max(m.abs().max().item(), SCALE_FLOOR_M)
+            S_v: float = max(v.max().item(), eps * eps)
+
+            # Quantise onto LUMA grid
+            w_min, delta_m, z_m, delta_w, z_w = F._precompute(S_m, S_v, eps)
+            Q_m = F._quantize_momentum(m, S_m, delta_m, z_m)
+            Q_w = F._quantize_preconditioner(v, eps, w_min, delta_w, z_w)
+
+            state = self.state[p]
+            state["step"] = step
+            state["param_id"] = self._next_param_id
+            self._next_param_id += 1
+            state["Q_m"] = Q_m
+            state["Q_w"] = Q_w
+
+            if self._use_triton and param is not None and param.is_cuda:
+                self._init_triton_buffers(
+                    state, param, S_m, S_v, beta1, beta2, step=step,
+                )
+            else:
+                state["S_m"] = S_m
+                state["S_v"] = S_v
+
+    # ------------------------------------------------------------------
     #  Internal: buffer allocation
     # ------------------------------------------------------------------
 
@@ -303,10 +388,6 @@ class LUMA(Optimizer):
     @staticmethod
     def _unwrap_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
         """Unwrap a DTensor to its local shard, or return a plain tensor as-is.
-
-        This makes LUMA transparent to FSDP2 (which wraps parameters in
-        ``DTensor``): the optimizer always operates on a regular
-        ``torch.Tensor`` with the correct local shape.
         """
         if t is None:
             return None
@@ -336,9 +417,7 @@ class LUMA(Optimizer):
                 if p.grad is None:
                     continue
 
-                # Unwrap DTensor (FSDP2) → local shard.  After this
-                # point only ``param`` / ``grad`` are used for
-                # computation; ``p`` is kept solely as the state key.
+                # Unwrap DTensor (FSDP2) → local shard.
                 param = self._unwrap_tensor(p)
                 grad = self._unwrap_tensor(p.grad)
 
