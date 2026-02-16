@@ -50,7 +50,9 @@ LUMA is a standard `torch.optim.Optimizer` and works out of the box with common 
 |---|---|---|
 | **DDP** (`DistributedDataParallel`) | Yes | No special configuration needed — each rank runs its own LUMA instance. |
 | **FSDP** (`FullyShardedDataParallel`) | Yes | Scales `S_m` / `S_v` are computed per-shard by design. **For checkpointing**, call `opt.export_adamw_state()` to materialise full FP32 states before saving — `FSDP.optim_state_dict()` cannot correctly gather per-shard scalar scales across ranks. |
+| **FSDP2** (DTensor-based) | Yes | DTensor parameters are transparently unwrapped to local shards via `_local_tensor`. No special configuration needed. |
 | **GradScaler** (AMP) | Yes | LUMA internally promotes gradients to float32, so fp16/bf16 inputs are handled correctly. Use `GradScaler` with `unscale_()` before `step()` as normal. |
+| **DeepSpeed ZeRO** | No | ZeRO partitions optimizer states assuming float32 tensors and cannot correctly handle LUMA's int16 quantised states or per-shard scalar scales. |
 
 ## Tests
 

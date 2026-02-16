@@ -324,8 +324,10 @@ def _luma_requantize_kernel(
 
     # Shift the seed (not the offset) to produce an independent PRNG
     # stream — avoids int32 overflow of ``offsets + n_elements`` when
-    # a tensor has > 1 billion parameters.
-    rand_w  = tl.rand(seed ^ 0x9E3779B9, offsets)
+    # a tensor has > 1 billion parameters.  The constant fits in 31
+    # bits to stay within Triton's int32 type (0x9E3779B9 would
+    # promote to int64).
+    rand_w  = tl.rand(seed ^ 0x3E3779B9, offsets)
     q_w_new = floor_y_w + tl.where(rand_w < p_star_w, 1.0, 0.0)
     q_w_new = tl.minimum(tl.maximum(q_w_new, 0.0), 65535.0)
 

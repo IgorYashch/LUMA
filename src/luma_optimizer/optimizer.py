@@ -21,6 +21,8 @@ compatible with external ``torch.cuda.CUDAGraph`` capture.
 
 from __future__ import annotations
 
+import random
+
 import torch
 from torch.optim import Optimizer
 
@@ -85,14 +87,7 @@ class LUMA(Optimizer):
 
         self._next_param_id = 0
 
-        # Sample a base seed for the Triton PRNG from the current PyTorch
-        # seed.  A dedicated Generator avoids perturbing the global RNG
-        # stream (which would break deterministic checkpoint round-trips).
-        _gen = torch.Generator()
-        _gen.manual_seed(torch.initial_seed())
-        self._base_seed: int = torch.randint(
-            0, 0x7FFFFFFF, (1,), generator=_gen,
-        ).item()
+        self._base_seed: int = random.randint(0, 0x7FFFFFFF)
 
         if backend == "auto":
             self._use_triton = _TRITON_AVAILABLE and torch.cuda.is_available()
@@ -124,11 +119,13 @@ class LUMA(Optimizer):
                 if k.startswith("_"):
                     continue  # skip internal Triton buffers
                 cs[k] = v
-            # Triton path: extract S_m / S_v from GPU buffer
+            # Triton path: extract S_m / S_v and true step from GPU
             if "_new_grid" in s:
                 ng = s["_new_grid"]
                 cs["S_m"] = ng[0].item()
                 cs["S_v"] = ng[1].item()
+            if "_step_tensor" in s:
+                cs["step"] = int(s["_step_tensor"].item())
             clean_state[idx] = cs
         raw["state"] = clean_state
         raw["_base_seed"] = self._base_seed
@@ -211,7 +208,12 @@ class LUMA(Optimizer):
                     continue
 
                 pidx = param_to_idx[id(p)]
-                step = state["step"]
+
+                # True step lives in _step_tensor on Triton path
+                if "_step_tensor" in state:
+                    step = int(state["_step_tensor"].item())
+                else:
+                    step = state["step"]
 
                 # Get S_m, S_v (from GPU buffer or Python float)
                 if "_new_grid" in state:
@@ -295,6 +297,24 @@ class LUMA(Optimizer):
         )
 
     # ------------------------------------------------------------------
+    #  DTensor / FSDP2 support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _unwrap_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
+        """Unwrap a DTensor to its local shard, or return a plain tensor as-is.
+
+        This makes LUMA transparent to FSDP2 (which wraps parameters in
+        ``DTensor``): the optimizer always operates on a regular
+        ``torch.Tensor`` with the correct local shape.
+        """
+        if t is None:
+            return None
+        if hasattr(t, "_local_tensor"):
+            return t._local_tensor
+        return t
+
+    # ------------------------------------------------------------------
     #  Main entry point
     # ------------------------------------------------------------------
 
@@ -316,7 +336,15 @@ class LUMA(Optimizer):
                 if p.grad is None:
                     continue
 
-                grad = p.grad
+                # Unwrap DTensor (FSDP2) → local shard.  After this
+                # point only ``param`` / ``grad`` are used for
+                # computation; ``p`` is kept solely as the state key.
+                param = self._unwrap_tensor(p)
+                grad = self._unwrap_tensor(p.grad)
+
+                if param.numel() == 0:
+                    continue  # empty FSDP shard on this rank
+
                 if grad.is_sparse:
                     raise RuntimeError("LUMA does not support sparse gradients")
 
@@ -334,23 +362,23 @@ class LUMA(Optimizer):
                 if t == 1:
                     # First step: pure FP32 + seed delayed scales
                     Q_m, Q_w, S_m, S_v = F.luma_init_step(
-                        p, grad, beta1, beta2, eps, lr, wd,
+                        param, grad, beta1, beta2, eps, lr, wd,
                     )
                     state["Q_m"] = Q_m
                     state["Q_w"] = Q_w
 
-                    if self._use_triton and p.is_cuda:
+                    if self._use_triton and param.is_cuda:
                         self._init_triton_buffers(
-                            state, p, S_m, S_v, beta1, beta2,
+                            state, param, S_m, S_v, beta1, beta2,
                         )
                     else:
                         state["S_m"] = S_m
                         state["S_v"] = S_v
                 else:
                     # Quantised step — Q_m / Q_w modified in-place
-                    if self._use_triton and p.is_cuda:
+                    if self._use_triton and param.is_cuda:
                         luma_triton_step(
-                            p, grad,
+                            param, grad,
                             state["Q_m"], state["Q_w"],
                             state["_old_scalars"], state["_new_grid"],
                             state["_s_m_block"], state["_s_v_block"],
@@ -362,7 +390,7 @@ class LUMA(Optimizer):
                         # S_m/S_v live in _new_grid[0:2] — no CPU sync
                     else:
                         S_m, S_v = F.luma_update_step(
-                            p, grad,
+                            param, grad,
                             state["Q_m"], state["Q_w"],
                             state["S_m"], state["S_v"],
                             t, beta1, beta2, eps, lr, wd,
