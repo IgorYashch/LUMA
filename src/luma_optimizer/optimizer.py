@@ -85,6 +85,15 @@ class LUMA(Optimizer):
 
         self._next_param_id = 0
 
+        # Sample a base seed for the Triton PRNG from the current PyTorch
+        # seed.  A dedicated Generator avoids perturbing the global RNG
+        # stream (which would break deterministic checkpoint round-trips).
+        _gen = torch.Generator()
+        _gen.manual_seed(torch.initial_seed())
+        self._base_seed: int = torch.randint(
+            0, 0x7FFFFFFF, (1,), generator=_gen,
+        ).item()
+
         if backend == "auto":
             self._use_triton = _TRITON_AVAILABLE and torch.cuda.is_available()
         elif backend == "triton":
@@ -122,6 +131,7 @@ class LUMA(Optimizer):
                 cs["S_v"] = ng[1].item()
             clean_state[idx] = cs
         raw["state"] = clean_state
+        raw["_base_seed"] = self._base_seed
         return raw
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -130,6 +140,7 @@ class LUMA(Optimizer):
         Handles cross-backend loading: a checkpoint saved with the PyTorch
         backend can be loaded into a Triton-backed optimiser and vice versa.
         """
+        self._base_seed = state_dict.get("_base_seed", self._base_seed)
         super().load_state_dict(state_dict)
 
         max_param_id = -1
@@ -257,9 +268,9 @@ class LUMA(Optimizer):
         bc1 = 1.0 - beta1 ** step
         bc2 = 1.0 - beta2 ** step
 
-        # old_scalars: [w_min, delta_m, delta_w, eta_t, bc2, bc1, step, reserved]
+        # old_scalars: [w_min, delta_m, delta_w, eta_t, bc2, bc1, reserved, reserved]
         state["_old_scalars"] = torch.tensor(
-            [0.0, 0.0, 0.0, 0.0, bc2, bc1, float(step), 0.0],
+            [0.0, 0.0, 0.0, 0.0, bc2, bc1, 0.0, 0.0],
             device=p.device,
             dtype=torch.float32,
         )
@@ -275,6 +286,12 @@ class LUMA(Optimizer):
         )
         state["_s_v_block"] = torch.empty(
             num_blocks, device=p.device, dtype=torch.float32,
+        )
+        # Step counter as int32 on GPU — survives CUDA Graph capture
+        # (scalar Python args are baked at capture time) and avoids
+        # the float32 precision ceiling at 2²⁴.
+        state["_step_tensor"] = torch.tensor(
+            [step], device=p.device, dtype=torch.int32,
         )
 
     # ------------------------------------------------------------------
@@ -339,6 +356,8 @@ class LUMA(Optimizer):
                             state["_s_m_block"], state["_s_v_block"],
                             beta1, beta2, eps, lr, wd,
                             state["param_id"],
+                            state["_step_tensor"],
+                            self._base_seed,
                         )
                         # S_m/S_v live in _new_grid[0:2] — no CPU sync
                     else:
