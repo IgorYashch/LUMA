@@ -14,12 +14,14 @@ def _available_devices() -> list[str]:
     return devices
 
 
-def _available_backends() -> list[str]:
-    """Return optimizer backends available in this environment."""
-    backends = ["pytorch"]
+def _valid_device_backend_configs() -> list[tuple[str, str]]:
+    """Return only valid (device, backend) pairs — no impossible combos."""
+    configs = [("cpu", "pytorch")]
+    if torch.cuda.is_available():
+        configs.append(("cuda", "pytorch"))
     if CUDA_AND_TRITON:
-        backends.append("triton")
-    return backends
+        configs.append(("cuda", "triton"))
+    return configs
 
 
 @pytest.fixture(autouse=True)
@@ -34,9 +36,10 @@ def device(request):
     return torch.device(request.param)
 
 
-@pytest.fixture(params=_available_backends(), ids=lambda b: b)
-def backend(request, device):
-    """Parametrised backend fixture — skips invalid device+backend combos."""
-    if request.param == "triton" and device.type != "cuda":
-        pytest.skip("Triton requires CUDA")
-    return request.param
+@pytest.fixture(
+    params=_valid_device_backend_configs(),
+    ids=lambda c: f"{c[0]}-{c[1]}",
+)
+def device_backend(request):
+    """Yields only valid (device, backend) pairs — zero skips."""
+    return torch.device(request.param[0]), request.param[1]
