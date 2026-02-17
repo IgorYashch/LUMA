@@ -48,11 +48,33 @@ LUMA is a standard `torch.optim.Optimizer` and works out of the box with common 
 
 | Setup | Compatible | Notes |
 |---|---|---|
-| **DDP** (`DistributedDataParallel`) | Yes | No special configuration needed — each rank runs its own LUMA instance. |
+| **DDP** (`DistributedDataParallel`) | Yes | Seed `torch` and CUDA RNGs identically on all ranks before creating the optimizer (see *Determinism* below). |
 | **FSDP** (`FullyShardedDataParallel`) | Yes | Scales `S_m` / `S_v` are computed per-shard by design. **For checkpointing**, call `opt.export_adamw_state()` to materialise full FP32 states before saving — `FSDP.optim_state_dict()` cannot correctly gather per-shard scalar scales across ranks. |
 | **FSDP2** (DTensor-based) | Yes | DTensor parameters are transparently unwrapped to local shards via `_local_tensor`. No special configuration needed. |
 | **GradScaler** (AMP) | Yes | LUMA internally promotes gradients to float32, so fp16/bf16 inputs are handled correctly. Use `GradScaler` with `unscale_()` before `step()` as normal. |
-| **DeepSpeed ZeRO** | No | ZeRO partitions optimizer states assuming float32 tensors and cannot correctly handle LUMA's int16 quantised states or per-shard scalar scales. |
+| **DeepSpeed ZeRO** | No | Will fix it in future |
+
+## Determinism / Reproducibility
+
+LUMA uses **stochastic rounding** at every optimiser step. To get fully
+reproducible training runs, seed PyTorch before creating the optimiser:
+
+```python
+import torch
+
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+opt = LUMA(model.parameters(), lr=1e-3)
+```
+
+`_base_seed` (the root of all quantisation-noise randomness) is drawn from
+the PyTorch global RNG at construction time via `torch.randint`. Both backends
+then derive a deterministic per-step per-parameter seed from `_base_seed`,
+step counter, and parameter index, so stochastic rounding is reproducible
+across DDP ranks as long as the PyTorch RNG state matches at optimizer
+construction — which it will if `torch.manual_seed()` is called identically
+on every rank before creating the model and optimizer.
 
 ## Tests
 

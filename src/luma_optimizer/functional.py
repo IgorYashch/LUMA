@@ -93,6 +93,20 @@ def _precompute(
 
 
 # ---------------------------------------------------------------------------
+# Deterministic per-step seed  (mirrors Triton kernel B convention)
+# ---------------------------------------------------------------------------
+
+def _make_step_seed(base_seed: int, step: int, param_id: int) -> int:
+    """Return a deterministic 31-bit seed for stochastic rounding.
+
+    Uses the same LCG-XOR formula as Triton kernel B so that,
+    given identical ``(base_seed, step, param_id)``, both backends
+    produce a reproducible (though not identical) PRNG stream.
+    """
+    return ((step * 1103515245 + base_seed) ^ (param_id * 22695477)) & 0x7FFFFFFF
+
+
+# ---------------------------------------------------------------------------
 # Decode quantised states  →  FP32 continuous values
 # ---------------------------------------------------------------------------
 
@@ -123,10 +137,11 @@ def _quantize_momentum(
     z_m: float,
     *,
     out: Tensor | None = None,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     m_clip = m.clamp(-S_m, S_m)
     y = torch.log1p(m_clip.abs()) / delta_m
-    rand = torch.rand_like(y)
+    rand = torch.rand_like(y, generator=generator)
     q_mag = _log_sr(y, delta_m, z_m, rand, K_M)
     q = (m_clip.sign() * q_mag).to(torch.int16)
     if out is not None:
@@ -143,6 +158,7 @@ def _quantize_preconditioner(
     z_w: float,
     *,
     out: Tensor | None = None,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     w = 1.0 / (v.sqrt() + eps)
     w_max = 1.0 / (2.0 * eps)
@@ -151,7 +167,7 @@ def _quantize_preconditioner(
         y = torch.log(w_clip / w_min) / delta_w
     else:
         y = torch.zeros_like(w_clip)
-    rand = torch.rand_like(y)
+    rand = torch.rand_like(y, generator=generator)
     q = _log_sr(y, delta_w, z_w, rand, K_W)
     q_int = _encode_uint16(q.to(torch.int32))
     if out is not None:
@@ -172,6 +188,8 @@ def luma_init_step(
     eps: float,
     lr: float,
     weight_decay: float,
+    *,
+    generator: torch.Generator | None = None,
 ) -> tuple[Tensor, Tensor, float, float]:
     """Step 0 — initialise in full FP32, then quantise & seed delayed scales.
 
@@ -204,8 +222,8 @@ def luma_init_step(
 
     # ── quantise ────────────────────────────────────────────────────────
     w_min, delta_m, z_m, delta_w, z_w = _precompute(S_m, S_v, eps)
-    Q_m = _quantize_momentum(m, S_m, delta_m, z_m)
-    Q_w = _quantize_preconditioner(v, eps, w_min, delta_w, z_w)
+    Q_m = _quantize_momentum(m, S_m, delta_m, z_m, generator=generator)
+    Q_w = _quantize_preconditioner(v, eps, w_min, delta_w, z_w, generator=generator)
 
     return Q_m, Q_w, S_m, S_v
 
@@ -223,6 +241,8 @@ def luma_update_step(
     eps: float,
     lr: float,
     weight_decay: float,
+    *,
+    generator: torch.Generator | None = None,
 ) -> tuple[float, float]:
     """Steps >= 2 — decode → update → re-quantise (matched scales).
 
@@ -271,7 +291,7 @@ def luma_update_step(
     w_min_new, delta_m_new, z_m_new, delta_w_new, z_w_new = _precompute(
         S_m_next, S_v_next, eps,
     )
-    _quantize_momentum(m_new, S_m_next, delta_m_new, z_m_new, out=Q_m)
-    _quantize_preconditioner(v_new, eps, w_min_new, delta_w_new, z_w_new, out=Q_w)
+    _quantize_momentum(m_new, S_m_next, delta_m_new, z_m_new, out=Q_m, generator=generator)
+    _quantize_preconditioner(v_new, eps, w_min_new, delta_w_new, z_w_new, out=Q_w, generator=generator)
 
     return S_m_next, S_v_next

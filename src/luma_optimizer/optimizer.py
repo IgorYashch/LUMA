@@ -21,8 +21,6 @@ compatible with external ``torch.cuda.CUDAGraph`` capture.
 
 from __future__ import annotations
 
-import random
-
 import torch
 from torch.optim import Optimizer
 
@@ -87,7 +85,9 @@ class LUMA(Optimizer):
 
         self._next_param_id = 0
 
-        self._base_seed: int = random.randint(0, 0x7FFFFFFF)
+        self._base_seed: int = int(torch.randint(0x7FFFFFFF, ()).item())
+
+        self._pt_gen: torch.Generator | None = None
 
         if backend == "auto":
             self._use_triton = _TRITON_AVAILABLE and torch.cuda.is_available()
@@ -309,15 +309,22 @@ class LUMA(Optimizer):
             S_m: float = max(m.abs().max().item(), SCALE_FLOOR_M)
             S_v: float = max(v.max().item(), eps * eps)
 
-            # Quantise onto LUMA grid
+            # Assign param_id first so we can derive a deterministic seed
+            param_id = self._next_param_id
+            self._next_param_id += 1
+
+            # Quantise onto LUMA grid (deterministic stochastic rounding)
+            gen = self._get_generator(
+                device, F._make_step_seed(self._base_seed, 0, param_id),
+            )
+
             w_min, delta_m, z_m, delta_w, z_w = F._precompute(S_m, S_v, eps)
-            Q_m = F._quantize_momentum(m, S_m, delta_m, z_m)
-            Q_w = F._quantize_preconditioner(v, eps, w_min, delta_w, z_w)
+            Q_m = F._quantize_momentum(m, S_m, delta_m, z_m, generator=gen)
+            Q_w = F._quantize_preconditioner(v, eps, w_min, delta_w, z_w, generator=gen)
 
             state = self.state[p]
             state["step"] = step
-            state["param_id"] = self._next_param_id
-            self._next_param_id += 1
+            state["param_id"] = param_id
             state["Q_m"] = Q_m
             state["Q_w"] = Q_w
 
@@ -381,6 +388,14 @@ class LUMA(Optimizer):
             [step], device=p.device, dtype=torch.int32,
         )
 
+    def _get_generator(self, device: torch.device, seed: int) -> torch.Generator:
+        gen = self._pt_gen
+        if gen is None or gen.device != device:
+            gen = torch.Generator(device=device)
+            self._pt_gen = gen
+        gen.manual_seed(seed)
+        return gen
+
     # ------------------------------------------------------------------
     #  DTensor / FSDP2 support
     # ------------------------------------------------------------------
@@ -439,9 +454,17 @@ class LUMA(Optimizer):
                 t = state["step"]
 
                 if t == 1:
-                    # First step: pure FP32 + seed delayed scales
+                    # First step: pure FP32 + seed delayed scales.
+                    # Always runs via PyTorch; use a seeded Generator
+                    # so that stochastic rounding is deterministic
+                    # across DDP ranks (given identical _base_seed).
+                    gen = self._get_generator(
+                        param.device,
+                        F._make_step_seed(self._base_seed, t, state["param_id"]),
+                    )
                     Q_m, Q_w, S_m, S_v = F.luma_init_step(
                         param, grad, beta1, beta2, eps, lr, wd,
+                        generator=gen,
                     )
                     state["Q_m"] = Q_m
                     state["Q_w"] = Q_w
@@ -468,11 +491,16 @@ class LUMA(Optimizer):
                         )
                         # S_m/S_v live in _new_grid[0:2] — no CPU sync
                     else:
+                        gen = self._get_generator(
+                            param.device,
+                            F._make_step_seed(self._base_seed, t, state["param_id"]),
+                        )
                         S_m, S_v = F.luma_update_step(
                             param, grad,
                             state["Q_m"], state["Q_w"],
                             state["S_m"], state["S_v"],
                             t, beta1, beta2, eps, lr, wd,
+                            generator=gen,
                         )
                         state["S_m"] = S_m
                         state["S_v"] = S_v

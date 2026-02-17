@@ -15,10 +15,16 @@ except ImportError:
     pass
 
 CUDA_AND_TRITON = torch.cuda.is_available() and _TRITON_AVAILABLE
+MULTI_GPU = torch.cuda.is_available() and torch.cuda.device_count() >= 2
 
 requires_cuda_triton = pytest.mark.skipif(
     not CUDA_AND_TRITON,
     reason="Requires CUDA + Triton",
+)
+
+requires_multi_gpu = pytest.mark.skipif(
+    not MULTI_GPU,
+    reason="Requires >= 2 CUDA GPUs",
 )
 
 
