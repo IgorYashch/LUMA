@@ -83,8 +83,6 @@ class LUMA(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-        self._next_param_id = 0
-
         self._base_seed: int = int(torch.randint(0x7FFFFFFF, ()).item())
 
         self._pt_gen: torch.Generator | None = None
@@ -140,18 +138,12 @@ class LUMA(Optimizer):
         self._base_seed = state_dict.get("_base_seed", self._base_seed)
         super().load_state_dict(state_dict)
 
-        max_param_id = -1
         for group in self.param_groups:
             beta1, beta2 = group["betas"]
             for p in group["params"]:
                 state = self.state[p]
                 if len(state) == 0:
                     continue
-
-                # Track highest param_id for _next_param_id
-                pid = state.get("param_id", -1)
-                if pid > max_param_id:
-                    max_param_id = pid
 
                 # Move quantised tensors to parameter's device if needed
                 for key in ("Q_m", "Q_w"):
@@ -175,8 +167,6 @@ class LUMA(Optimizer):
                     # S_m/S_v now live inside _new_grid[0:2]; drop stale floats
                     state.pop("S_m", None)
                     state.pop("S_v", None)
-
-        self._next_param_id = max_param_id + 1
 
     # ------------------------------------------------------------------
     #  Export dequantised state → AdamW format
@@ -278,8 +268,6 @@ class LUMA(Optimizer):
                 param_group_map[len(all_params)] = group
                 all_params.append(p)
 
-        self._next_param_id = 0
-
         for idx_key, adamw_state in adamw_sd["state"].items():
             idx = int(idx_key) if isinstance(idx_key, str) else idx_key
             if idx >= len(all_params):
@@ -309,13 +297,9 @@ class LUMA(Optimizer):
             S_m: float = max(m.abs().max().item(), SCALE_FLOOR_M)
             S_v: float = max(v.max().item(), eps * eps)
 
-            # Assign param_id first so we can derive a deterministic seed
-            param_id = self._next_param_id
-            self._next_param_id += 1
-
             # Quantise onto LUMA grid (deterministic stochastic rounding)
             gen = self._get_generator(
-                device, F._make_step_seed(self._base_seed, 0, param_id),
+                device, F._make_step_seed(self._base_seed, 0, idx),
             )
 
             w_min, delta_m, z_m, delta_w, z_w = F._precompute(S_m, S_v, eps)
@@ -324,7 +308,7 @@ class LUMA(Optimizer):
 
             state = self.state[p]
             state["step"] = step
-            state["param_id"] = param_id
+            state["param_id"] = idx
             state["Q_m"] = Q_m
             state["Q_w"] = Q_w
 
@@ -422,6 +406,7 @@ class LUMA(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        param_idx = 0
         for group in self.param_groups:
             beta1, beta2 = group["betas"]
             eps = group["eps"]
@@ -429,6 +414,7 @@ class LUMA(Optimizer):
             wd = group["weight_decay"]
 
             for p in group["params"]:
+                param_idx += 1
                 if p.grad is None:
                     continue
 
@@ -454,8 +440,7 @@ class LUMA(Optimizer):
                 # ── initialise on first encounter ────────────────────
                 if len(state) == 0:
                     state["step"] = 0
-                    state["param_id"] = self._next_param_id
-                    self._next_param_id += 1
+                    state["param_id"] = param_idx - 1
 
                 state["step"] += 1
                 t = state["step"]

@@ -122,22 +122,28 @@ class TestStateDict:
         model2(torch.randn(1, 8, device=device)).sum().backward()
         opt2.step()
 
-    def test_param_id_counter_after_load(self, device_backend):
-        """_next_param_id continues from the highest loaded ID."""
+    def test_param_id_preserved_after_load(self, device_backend):
+        """param_id values survive a save/load round-trip."""
         device, backend = device_backend
         model = nn.Linear(8, 4).to(device)
         opt = LUMA(model.parameters(), backend=backend)
         model(torch.randn(1, 8, device=device)).sum().backward()
         opt.step()
 
-        sd = opt.state_dict()
-        max_id = max(s["param_id"] for s in sd["state"].values())
+        orig_ids = {
+            idx: s["param_id"]
+            for idx, s in opt.state_dict()["state"].items()
+        }
 
         model2 = nn.Linear(8, 4).to(device)
         opt2 = LUMA(model2.parameters(), backend=backend)
-        opt2.load_state_dict(sd)
+        opt2.load_state_dict(opt.state_dict())
 
-        assert opt2._next_param_id == max_id + 1
+        loaded_ids = {
+            idx: s["param_id"]
+            for idx, s in opt2.state_dict()["state"].items()
+        }
+        assert orig_ids == loaded_ids
 
     def test_double_save_load(self, device_backend):
         """Two consecutive save/load cycles produce same result as straight run."""
