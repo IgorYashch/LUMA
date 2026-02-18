@@ -7,6 +7,7 @@ failure.  Tests are skipped entirely on single-GPU or CPU-only machines.
 
 import os
 import socket
+import tempfile
 
 import pytest
 import torch
@@ -69,8 +70,13 @@ def _worker_entry(rank: int, world_size: int, port: int, fn):
     """Per-process bootstrap: init NCCL, run test, tear down."""
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Isolate Triton JIT cache per worker to prevent compilation races
+    # when multiple spawned processes compile the same kernel concurrently.
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(
+        tempfile.gettempdir(), f".triton_test_rank{rank}_{os.getpid()}",
+    )
     torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
     seed_all(42)
     try:
         fn(rank, world_size)
