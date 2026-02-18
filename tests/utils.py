@@ -16,6 +16,10 @@ except ImportError:
 
 CUDA_AND_TRITON = torch.cuda.is_available() and _TRITON_AVAILABLE
 MULTI_GPU = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+GPU_BF16 = (
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] >= 8
+)
 
 requires_cuda_triton = pytest.mark.skipif(
     not CUDA_AND_TRITON,

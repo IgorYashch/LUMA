@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from luma_optimizer import LUMA
+from utils import GPU_BF16
 
 
 # ── creation  (device-independent) ──────────────────────────────────────────
@@ -154,6 +155,15 @@ class TestMemory:
 
 class TestMixedPrecision:
     """Verify LUMA works correctly with reduced-precision params and grads."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_bf16_on_old_gpu(self, device, request):
+        if device.type != "cuda" or GPU_BF16:
+            return
+        cs = getattr(request.node, "callspec", None)
+        dtype = cs.params.get("dtype") if cs else None
+        if dtype == torch.bfloat16 or "bfloat16" in request.node.name:
+            pytest.skip("bf16 Triton kernels need sm_80+")
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_step_no_crash(self, dtype, device):
