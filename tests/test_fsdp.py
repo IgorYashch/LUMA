@@ -5,100 +5,20 @@ Each test spawns ``world_size`` GPU worker processes via
 failure.  Tests are skipped entirely on single-GPU or CPU-only machines.
 """
 
-import os
-import socket
-import tempfile
-
-import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 
 from luma_optimizer import LUMA
 from luma_optimizer.config import get_kernel_config
-from utils import CUDA_AND_TRITON, MULTI_GPU, seed_all
-
-# ── FSDP2 availability ──────────────────────────────────────────────────────
-_FSDP2_AVAILABLE = False
-try:
-    from torch.distributed._composable.fsdp import fully_shard  # noqa: F401
-
-    _FSDP2_AVAILABLE = True
-except ImportError:
-    pass
-
-requires_fsdp2 = pytest.mark.skipif(
-    not (MULTI_GPU and _FSDP2_AVAILABLE),
-    reason="Requires >= 2 CUDA GPUs + PyTorch FSDP2 (torch >= 2.4)",
+from utils import (
+    SimpleMLP,
+    requires_fsdp2,
+    requires_fsdp2_triton,
+    requires_multi_gpu,
+    run_workers,
+    seed_all,
 )
-
-requires_fsdp2_triton = pytest.mark.skipif(
-    not (MULTI_GPU and _FSDP2_AVAILABLE and CUDA_AND_TRITON),
-    reason="Requires >= 2 CUDA GPUs + FSDP2 + Triton",
-)
-
-requires_multi_gpu = pytest.mark.skipif(
-    not MULTI_GPU,
-    reason="Requires >= 2 CUDA GPUs",
-)
-
-
-# =====================================================================
-#  Distributed test harness
-# =====================================================================
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port that is (momentarily) free."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def _run_workers(fn, world_size: int = 2):
-    """Launch *fn(rank, world_size)* on *world_size* GPU processes."""
-    port = _find_free_port()
-    mp.spawn(
-        _worker_entry,
-        args=(world_size, port, fn),
-        nprocs=world_size,
-        join=True,
-    )
-
-
-def _worker_entry(rank: int, world_size: int, port: int, fn):
-    """Per-process bootstrap: init NCCL, run test, tear down."""
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    # Isolate Triton JIT cache per worker to prevent compilation races
-    # when multiple spawned processes compile the same kernel concurrently.
-    os.environ["TRITON_CACHE_DIR"] = os.path.join(
-        tempfile.gettempdir(), f".triton_test_rank{rank}_{os.getpid()}",
-    )
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    seed_all(42)
-    try:
-        fn(rank, world_size)
-    finally:
-        dist.destroy_process_group()
-
-
-# =====================================================================
-#  Shared model
-# =====================================================================
-
-class SimpleMLP(nn.Module):
-    """Tiny MLP used across FSDP tests."""
-
-    def __init__(self, d_in=64, d_hidden=128, d_out=1):
-        super().__init__()
-        self.fc1 = nn.Linear(d_in, d_hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(d_hidden, d_out)
-
-    def forward(self, x):
-        return self.fc2(self.relu(self.fc1(x)))
 
 
 # =====================================================================
@@ -111,19 +31,19 @@ class TestFSDP2:
 
     def test_basic_convergence(self):
         """FSDP2 + LUMA converges on a fixed regression task."""
-        _run_workers(_fsdp2_convergence_impl)
+        run_workers(_fsdp2_convergence_impl)
 
     def test_state_dict_roundtrip(self):
         """state_dict → load_state_dict under FSDP2: training continues."""
-        _run_workers(_fsdp2_state_dict_impl)
+        run_workers(_fsdp2_state_dict_impl)
 
     def test_per_shard_scaling(self):
         """S_m / S_v are computed per local shard, not globally."""
-        _run_workers(_fsdp2_per_shard_scaling_impl)
+        run_workers(_fsdp2_per_shard_scaling_impl)
 
     def test_export_adamw(self):
         """export_adamw_state produces valid per-shard states."""
-        _run_workers(_fsdp2_export_adamw_impl)
+        run_workers(_fsdp2_export_adamw_impl)
 
 
 @requires_fsdp2_triton
@@ -131,7 +51,7 @@ class TestFSDP2Triton:
 
     def test_triton_buffer_sizes(self):
         """Triton buffers are sized for the local shard, not global param."""
-        _run_workers(_fsdp2_triton_buffers_impl)
+        run_workers(_fsdp2_triton_buffers_impl)
 
 
 # ── FSDP2 worker implementations ─────────────────────────────────────────────
@@ -146,7 +66,6 @@ def _fsdp2_convergence_impl(rank, world_size):
 
     opt = LUMA(model.parameters(), lr=1e-2, weight_decay=0.0)
 
-    # Fixed data — same on all ranks (CUDA generators seeded identically)
     torch.cuda.manual_seed(0)
     x = torch.randn(32, 64, device="cuda")
     target = torch.randn(32, 1, device="cuda")
@@ -181,7 +100,6 @@ def _fsdp2_state_dict_impl(rank, world_size):
     x = torch.randn(16, 64, device="cuda")
     target = torch.randn(16, 1, device="cuda")
 
-    # Train 5 steps
     for _ in range(5):
         opt.zero_grad()
         nn.functional.mse_loss(model(x), target).backward()
@@ -192,7 +110,6 @@ def _fsdp2_state_dict_impl(rank, world_size):
     # ── Save ─────────────────────────────────────────────────────────
     sd = opt.state_dict()
 
-    # Verify state dict is clean — no private Triton keys leaked
     for idx, s in sd["state"].items():
         for k in s:
             assert not k.startswith("_"), (
@@ -207,7 +124,6 @@ def _fsdp2_state_dict_impl(rank, world_size):
     opt2 = LUMA(model.parameters(), lr=1e-2)
     opt2.load_state_dict(sd)
 
-    # Continue training — loss must keep decreasing
     for _ in range(10):
         opt2.zero_grad()
         nn.functional.mse_loss(model(x), target).backward()
@@ -223,16 +139,11 @@ def _fsdp2_state_dict_impl(rank, world_size):
 def _fsdp2_per_shard_scaling_impl(rank, world_size):
     from torch.distributed._composable.fsdp import fully_shard
 
-    # Large linear — FSDP shards weight[256, 128] along dim 0,
-    # so rank 0 gets rows 0-127, rank 1 gets rows 128-255.
     model = nn.Linear(128, 256, bias=False).cuda()
     fully_shard(model)
 
     opt = LUMA(model.parameters(), lr=1e-2, weight_decay=0.0)
 
-    # Structured target: large for first-half outputs, small for second-half.
-    # This makes grad rows 0-127 large and rows 128-255 small,
-    # which aligns with the shard split → different S_m per rank.
     torch.cuda.manual_seed(0)
     x = torch.randn(32, 128, device="cuda")
     target = torch.zeros(32, 256, device="cuda")
@@ -267,7 +178,6 @@ def _fsdp2_per_shard_scaling_impl(rank, world_size):
                 f"— scaling may not be per-shard"
             )
 
-        # Sanity: Q_m shape must match local shard, not global param
         local_numel = opt._unwrap_tensor(p).numel()
         assert state["Q_m"].numel() == local_numel, (
             f"Q_m numel {state['Q_m'].numel()} != local shard {local_numel}"
@@ -298,7 +208,6 @@ def _fsdp2_export_adamw_impl(rank, world_size):
     assert "state" in adamw_sd
     assert "param_groups" in adamw_sd
 
-    # Exported shapes must match LOCAL shard shapes (not global DTensor)
     params = list(model.parameters())
     for idx, s in adamw_sd["state"].items():
         local_shape = opt._unwrap_tensor(params[idx]).shape
@@ -325,7 +234,6 @@ def _fsdp2_triton_buffers_impl(rank, world_size):
     torch.cuda.manual_seed(0)
     x = torch.randn(16, 128, device="cuda")
 
-    # Step 1 = init (FP32), step 2 = first Triton quantised step
     for _ in range(2):
         opt.zero_grad()
         model(x).sum().backward()
@@ -336,7 +244,6 @@ def _fsdp2_triton_buffers_impl(rank, world_size):
         local_shard = opt._unwrap_tensor(p)
         local_numel = local_shard.numel()
 
-        # Quantised states must match LOCAL shard
         assert state["Q_m"].numel() == local_numel, (
             f"Q_m numel {state['Q_m'].numel()} != local shard {local_numel}"
         )
@@ -344,7 +251,6 @@ def _fsdp2_triton_buffers_impl(rank, world_size):
             f"Q_w numel {state['Q_w'].numel()} != local shard {local_numel}"
         )
 
-        # Block reduction buffers sized for local shard, not global
         kcfg = get_kernel_config(local_shard.device)
         block_size = kcfg["BLOCK_SIZE"]
         expected_blocks = (local_numel + block_size - 1) // block_size
@@ -357,14 +263,13 @@ def _fsdp2_triton_buffers_impl(rank, world_size):
             f"expected {expected_blocks} for {local_numel} local elements"
         )
 
-        # Step tensor must exist and be on GPU
         assert "_step_tensor" in state
         assert state["_step_tensor"].device.type == "cuda"
         assert state["_step_tensor"].item() == 2
 
 
 # =====================================================================
-#  FSDP1 tests (FullyShardedDataParallel — legacy)
+#  DDP / FSDP1 tests
 # =====================================================================
 
 
@@ -374,7 +279,7 @@ class TestDDPDeterminism:
     def test_ranks_identical_after_training(self):
         """Real DDP: all ranks have identical params after training
         with different data and polluted global CUDA RNG."""
-        _run_workers(_ddp_determinism_impl)
+        run_workers(_ddp_determinism_impl)
 
 
 @requires_fsdp2
@@ -383,7 +288,7 @@ class TestFSDP2Determinism:
     def test_run_to_run_determinism(self):
         """Two FSDP2 runs with same seed produce identical params,
         even when global CUDA RNG is polluted on the second run."""
-        _run_workers(_fsdp2_determinism_impl)
+        run_workers(_fsdp2_determinism_impl)
 
 
 @requires_multi_gpu
@@ -391,10 +296,10 @@ class TestFSDP1:
 
     def test_basic_convergence(self):
         """FSDP1 + LUMA converges on a fixed regression task."""
-        _run_workers(_fsdp1_convergence_impl)
+        run_workers(_fsdp1_convergence_impl)
 
 
-# ── FSDP1 worker implementation ──────────────────────────────────────────────
+# ── DDP / FSDP1 worker implementations ───────────────────────────────────────
 
 def _fsdp1_convergence_impl(rank, world_size):
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -424,8 +329,6 @@ def _fsdp1_convergence_impl(rank, world_size):
     )
 
 
-# ── DDP determinism worker ────────────────────────────────────────────────────
-
 def _ddp_determinism_impl(rank, world_size):
     from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -435,7 +338,6 @@ def _ddp_determinism_impl(rank, world_size):
 
     n_steps = 20
     for step in range(n_steps):
-        # Per-rank different data (realistic distributed scenario)
         torch.cuda.manual_seed(step * world_size + rank)
         x = torch.randn(16, 64, device="cuda")
         target = torch.randn(16, 1, device="cuda")
@@ -443,11 +345,9 @@ def _ddp_determinism_impl(rank, world_size):
         opt.zero_grad()
         nn.functional.mse_loss(model(x), target).backward()
 
-        # Pollute global CUDA RNG (simulates dropout / augmentation)
         torch.rand(rank * 200 + step * 13 + 1, device="cuda")
         opt.step()
 
-    # All ranks must have bitwise-identical params
     for name, p in model.named_parameters():
         gathered = [torch.zeros_like(p.data) for _ in range(world_size)]
         dist.all_gather(gathered, p.data.contiguous())
@@ -460,15 +360,12 @@ def _ddp_determinism_impl(rank, world_size):
                 )
 
 
-# ── FSDP2 determinism worker ─────────────────────────────────────────────────
-
 def _fsdp2_determinism_impl(rank, world_size):
     from torch.distributed._composable.fsdp import fully_shard
 
     results = []
     for run_idx in range(2):
         seed_all(42)
-        torch.cuda.manual_seed(42)
 
         model = SimpleMLP().cuda()
         fully_shard(model.fc1)
@@ -484,7 +381,6 @@ def _fsdp2_determinism_impl(rank, world_size):
         for step in range(20):
             opt.zero_grad()
             nn.functional.mse_loss(model(x), target).backward()
-            # Pollute global CUDA RNG on the second run only
             if run_idx == 1:
                 torch.rand(rank * 100 + step + 1, device="cuda")
             opt.step()

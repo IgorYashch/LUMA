@@ -324,9 +324,7 @@ def _luma_requantize_kernel(
 
     # Shift the seed (not the offset) to produce an independent PRNG
     # stream — avoids int32 overflow of ``offsets + n_elements`` when
-    # a tensor has > 1 billion parameters.  The constant fits in 31
-    # bits to stay within Triton's int32 type (0x9E3779B9 would
-    # promote to int64).
+    # a tensor has > 1 billion parameters.
     rand_w  = tl.rand(seed ^ 0x3E3779B9, offsets)
     q_w_new = floor_y_w + tl.where(rand_w < p_star_w, 1.0, 0.0)
     q_w_new = tl.minimum(tl.maximum(q_w_new, 0.0), 65535.0)
@@ -370,6 +368,10 @@ def luma_triton_step(
     synchronisation, making the call compatible with
     ``torch.cuda.CUDAGraph`` capture.
     """
+    if param.dtype != torch.float32:
+        raise ValueError(
+            f"LUMA Triton kernel requires float32 parameters (got {param.dtype})"
+        )
     if not param.is_contiguous():
         raise ValueError("LUMA Triton kernel requires contiguous parameters")
     grad = grad.contiguous()

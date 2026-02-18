@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 from luma_optimizer import LUMA
-from luma_optimizer.functional import _precompute, _decode_momentum, _decode_preconditioner
 from utils import requires_cuda_triton, seed_all
 
 

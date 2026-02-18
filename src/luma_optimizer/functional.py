@@ -193,12 +193,11 @@ def luma_init_step(
 ) -> tuple[Tensor, Tensor, float, float]:
     """Step 0 — initialise in full FP32, then quantise & seed delayed scales.
 
-    All intermediate arithmetic is promoted to float32 so that bf16 / fp16
-    parameters and gradients are handled correctly.
+    Parameters must be float32.  Gradients may be any floating-point dtype
+    (e.g. fp16 / bf16 from ``torch.autocast``) and are promoted internally.
 
     Returns ``(Q_m, Q_w, S_m, S_v)``.
     """
-    # ── promote to float32 for numerical stability (bf16/fp16 safe) ─────
     grad_fp32 = grad.float()
 
     # ── raw EMA from zero-init ──────────────────────────────────────────
@@ -210,11 +209,8 @@ def luma_init_step(
     bc2 = 1.0 - beta2
     eta_t = lr / bc1
 
-    p_fp32 = param.float()
-    p_fp32.mul_(1.0 - lr * weight_decay)
-    p_fp32.addcdiv_(m, (v / bc2).sqrt().add_(eps), value=-eta_t)
-    if p_fp32.data_ptr() != param.data_ptr():
-        param.copy_(p_fp32)
+    param.mul_(1.0 - lr * weight_decay)
+    param.addcdiv_(m, (v / bc2).sqrt().add_(eps), value=-eta_t)
 
     # ── seed delayed scales ─────────────────────────────────────────────
     S_m: float = max(m.abs().max().item(), SCALE_FLOOR_M)
@@ -250,13 +246,12 @@ def luma_update_step(
     matching grid.  This eliminates the encode-decode drift of single-pass
     delayed scaling.
 
-    All intermediate arithmetic is promoted to float32 so that bf16 / fp16
-    parameters and gradients are handled correctly.
+    Parameters must be float32.  Gradients may be any floating-point dtype
+    (e.g. fp16 / bf16 from ``torch.autocast``) and are promoted internally.
 
     Modifies *param*, *Q_m*, *Q_w* **in-place**.
     Returns ``(S_m_next, S_v_next)``.
     """
-    # ── promote to float32 for numerical stability (bf16/fp16 safe) ─────
     grad_fp32 = grad.float()
 
     # ── host precompute ─────────────────────────────────────────────────
@@ -274,11 +269,8 @@ def luma_update_step(
     m_new = beta1 * m + (1.0 - beta1) * grad_fp32
     v_new = (beta2 * v + (1.0 - beta2) * grad_fp32.square()).clamp(min=eps * eps)
 
-    p_fp32 = param.float()
-    p_fp32.mul_(1.0 - weight_decay * lr)
-    p_fp32.addcdiv_(m_new, (v_new / bc2).sqrt().add_(eps), value=-eta_t)
-    if p_fp32.data_ptr() != param.data_ptr():
-        param.copy_(p_fp32)
+    param.mul_(1.0 - weight_decay * lr)
+    param.addcdiv_(m_new, (v_new / bc2).sqrt().add_(eps), value=-eta_t)
 
     # ── 3. track new scales ─────────────────────────────────────────────
     S_m_next: float = max(m_new.abs().max().item(), SCALE_FLOOR_M)

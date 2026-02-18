@@ -5,10 +5,11 @@ import torch
 import torch.nn as nn
 
 from luma_optimizer import LUMA
-from utils import GPU_BF16
 
 
-# ── creation  (device-independent) ──────────────────────────────────────────
+# =====================================================================
+#  Creation (device-independent)
+# =====================================================================
 
 
 class TestCreation:
@@ -45,7 +46,9 @@ class TestCreation:
             LUMA(model.parameters(), **kwargs)
 
 
-# ── stepping  (parametrised over devices) ───────────────────────────────────
+# =====================================================================
+#  Stepping (parametrised over devices)
+# =====================================================================
 
 
 class TestStepping:
@@ -96,7 +99,88 @@ class TestStepping:
         assert torch.is_tensor(returned)
 
 
-# ── state shapes & dtypes ──────────────────────────────────────────────────
+# =====================================================================
+#  Edge cases
+# =====================================================================
+
+
+class TestEdgeCases:
+    def test_lr_zero_no_update(self, device):
+        """With lr=0, parameters must remain unchanged after stepping."""
+        model = nn.Linear(8, 4).to(device)
+        opt = LUMA(model.parameters(), lr=0.0, weight_decay=0.0)
+        before = [p.data.clone() for p in model.parameters()]
+
+        model(torch.randn(2, 8, device=device)).sum().backward()
+        opt.step()
+
+        for p, b in zip(model.parameters(), before):
+            assert torch.equal(p.data, b)
+
+    def test_scalar_parameter(self, device):
+        """A single-element (scalar-shaped) parameter must work."""
+        x = torch.tensor(5.0, device=device, requires_grad=True)
+        opt = LUMA([x], lr=1e-2)
+        for _ in range(5):
+            opt.zero_grad()
+            (x ** 2).backward()
+            opt.step()
+        assert x.item() < 5.0
+
+    def test_gradient_accumulation(self, device):
+        """Multiple backward passes before one step must work correctly."""
+        model = nn.Linear(8, 4).to(device)
+        opt = LUMA(model.parameters(), lr=1e-3)
+        before = [p.data.clone() for p in model.parameters()]
+
+        for _ in range(3):
+            model(torch.randn(2, 8, device=device)).sum().backward()
+        opt.step()
+
+        for p, b in zip(model.parameters(), before):
+            assert not torch.equal(p.data, b), "Params should change"
+
+    def test_zero_grad_set_to_none_false(self, device):
+        """zero_grad(set_to_none=False) zeros gradients instead of None."""
+        model = nn.Linear(8, 4).to(device)
+        opt = LUMA(model.parameters(), lr=1e-3)
+
+        model(torch.randn(2, 8, device=device)).sum().backward()
+        opt.step()
+        opt.zero_grad(set_to_none=False)
+
+        for p in model.parameters():
+            assert p.grad is not None
+            assert (p.grad == 0).all()
+
+        model(torch.randn(2, 8, device=device)).sum().backward()
+        opt.step()
+
+        for p in model.parameters():
+            assert p.isfinite().all()
+
+    def test_zero_grad_set_to_none_true(self, device):
+        """zero_grad(set_to_none=True) sets gradients to None."""
+        model = nn.Linear(8, 4).to(device)
+        opt = LUMA(model.parameters(), lr=1e-3)
+
+        model(torch.randn(2, 8, device=device)).sum().backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+        for p in model.parameters():
+            assert p.grad is None
+
+        model(torch.randn(2, 8, device=device)).sum().backward()
+        opt.step()
+
+        for p in model.parameters():
+            assert p.isfinite().all()
+
+
+# =====================================================================
+#  State shapes & dtypes
+# =====================================================================
 
 
 class TestStateDtypes:
@@ -131,7 +215,9 @@ class TestStateDtypes:
             assert s["Q_w"].device.type == device.type
 
 
-# ── memory footprint ───────────────────────────────────────────────────────
+# =====================================================================
+#  Memory footprint
+# =====================================================================
 
 
 class TestMemory:
@@ -148,71 +234,3 @@ class TestMemory:
             q_m_bytes = s["Q_m"].element_size() * s["Q_m"].numel()
             q_w_bytes = s["Q_w"].element_size() * s["Q_w"].numel()
             assert q_m_bytes + q_w_bytes == 4 * p.numel()
-
-
-# ── mixed precision (bf16 / fp16) ────────────────────────────────────────────
-
-
-class TestMixedPrecision:
-    """Verify LUMA works correctly with reduced-precision params and grads."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_bf16_on_old_gpu(self, device, request):
-        if device.type != "cuda" or GPU_BF16:
-            return
-        cs = getattr(request.node, "callspec", None)
-        dtype = cs.params.get("dtype") if cs else None
-        if dtype == torch.bfloat16 or "bfloat16" in request.node.name:
-            pytest.skip("bf16 Triton kernels need sm_80+")
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_step_no_crash(self, dtype, device):
-        """Single step succeeds; param dtype preserved, states are int16."""
-        model = nn.Linear(16, 8).to(dtype).to(device)
-        opt = LUMA(model.parameters())
-        model(torch.randn(2, 16, device=device, dtype=dtype)).sum().backward()
-        opt.step()
-        for p in model.parameters():
-            assert p.dtype == dtype, f"dtype changed from {dtype}"
-            assert p.isfinite().all(), f"NaN/Inf in params with {dtype}"
-            s = opt.state[p]
-            assert s["Q_m"].dtype == torch.int16
-            assert s["Q_w"].dtype == torch.int16
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_twenty_steps_stable(self, dtype, device):
-        """Twenty consecutive steps produce no NaN/Inf."""
-        model = nn.Linear(16, 8).to(dtype).to(device)
-        opt = LUMA(model.parameters(), lr=1e-3)
-        for _ in range(20):
-            model(torch.randn(2, 16, device=device, dtype=dtype)).sum().backward()
-            opt.step()
-            opt.zero_grad()
-        for p in model.parameters():
-            assert p.isfinite().all(), f"Non-finite params with {dtype} on {device}"
-
-    def test_convergence_bfloat16(self, device):
-        """LUMA converges on a regression task with bfloat16 params."""
-        dtype = torch.bfloat16
-        d = 16
-        model = nn.Sequential(
-            nn.Linear(d, 32), nn.ReLU(), nn.Linear(32, 1)
-        ).to(dtype).to(device)
-        opt = LUMA(model.parameters(), lr=1e-3, weight_decay=0.01)
-
-        X = torch.randn(100, d, device=device, dtype=dtype)
-        y = torch.randn(100, 1, device=device, dtype=dtype)
-
-        init_loss = None
-        for _ in range(200):
-            opt.zero_grad()
-            loss = nn.functional.mse_loss(model(X).float(), y.float())
-            if init_loss is None:
-                init_loss = loss.item()
-            loss.backward()
-            opt.step()
-
-        assert loss.item() < init_loss * 0.5, (
-            f"bf16 convergence failed on {device}: "
-            f"{init_loss:.4f} -> {loss.item():.4f}"
-        )

@@ -442,6 +442,13 @@ class LUMA(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("LUMA does not support sparse gradients")
 
+                if param.dtype != torch.float32:
+                    raise ValueError(
+                        f"LUMA requires float32 parameters (got {param.dtype}). "
+                        f"Use torch.amp.autocast() or FSDP MixedPrecision "
+                        f"instead of casting model weights to a reduced dtype."
+                    )
+
                 state = self.state[p]
 
                 # ── initialise on first encounter ────────────────────
