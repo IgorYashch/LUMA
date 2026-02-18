@@ -196,7 +196,7 @@ class TestMixedPrecision:
         init_loss = None
         for _ in range(200):
             opt.zero_grad()
-            loss = nn.functional.mse_loss(model(X), y)
+            loss = nn.functional.mse_loss(model(X).float(), y.float())
             if init_loss is None:
                 init_loss = loss.item()
             loss.backward()
