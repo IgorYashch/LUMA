@@ -85,8 +85,6 @@ class LUMA(Optimizer):
 
         self._base_seed: int = int(torch.randint(0x7FFFFFFF, ()).item())
 
-        self._pt_gen: torch.Generator | None = None
-
         if backend == "auto":
             self._use_triton = _TRITON_AVAILABLE and torch.cuda.is_available()
         elif backend == "triton":
@@ -372,11 +370,9 @@ class LUMA(Optimizer):
             [step], device=p.device, dtype=torch.int32,
         )
 
-    def _get_generator(self, device: torch.device, seed: int) -> torch.Generator:
-        gen = self._pt_gen
-        if gen is None or gen.device != device:
-            gen = torch.Generator(device=device)
-            self._pt_gen = gen
+    @staticmethod
+    def _get_generator(device: torch.device, seed: int) -> torch.Generator:
+        gen = torch.Generator(device=device)
         gen.manual_seed(seed)
         return gen
 
