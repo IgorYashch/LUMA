@@ -141,7 +141,7 @@ def _quantize_momentum(
 ) -> Tensor:
     m_clip = m.clamp(-S_m, S_m)
     y = torch.log1p(m_clip.abs()) / delta_m
-    rand = torch.rand_like(y, generator=generator)
+    rand = torch.rand(y.shape, dtype=y.dtype, device=y.device, generator=generator)
     q_mag = _log_sr(y, delta_m, z_m, rand, K_M)
     q = (m_clip.sign() * q_mag).to(torch.int16)
     if out is not None:
@@ -167,7 +167,7 @@ def _quantize_preconditioner(
         y = torch.log(w_clip / w_min) / delta_w
     else:
         y = torch.zeros_like(w_clip)
-    rand = torch.rand_like(y, generator=generator)
+    rand = torch.rand(y.shape, dtype=y.dtype, device=y.device, generator=generator)
     q = _log_sr(y, delta_w, z_w, rand, K_W)
     q_int = _encode_uint16(q.to(torch.int32))
     if out is not None:
