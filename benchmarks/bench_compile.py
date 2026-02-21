@@ -78,7 +78,6 @@ def _make_optimizer(name: str, model: nn.Module, lr: float = 1e-3):
     raise ValueError(f"Unknown optimizer: {name}")
 
 
-@torch.no_grad()
 def _measure_step_time(
     model: nn.Module,
     opt,
