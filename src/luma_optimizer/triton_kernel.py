@@ -265,8 +265,11 @@ def _luma_requantize_kernel(
     w_max       = tl.load(new_grid_ptr + 7)
 
     # ── deterministic PRNG seed from (step, param_id, base_seed) ─────
-    step_i = tl.load(step_ptr)
-    seed = ((step_i * 1103515245 + base_seed) ^ (param_id * 22695477)) & 0x7FFFFFFF
+    step_64 = tl.load(step_ptr).to(tl.int64)
+    param_id_64 = param_id.to(tl.int64)
+    base_seed_64 = base_seed.to(tl.int64)
+    seed_m = ((step_64 << 32) | (param_id_64 * 2)) ^ base_seed_64
+    seed_w = ((step_64 << 32) | (param_id_64 * 2 + 1)) ^ base_seed_64
 
     # ── Load grad + OLD quantised states ─────────────────────────────
     grad    = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -299,7 +302,7 @@ def _luma_requantize_kernel(
     p_star_m  = _safe_expm1(frac_m * delta_m_new) / z_m_new
     p_star_m  = tl.minimum(tl.maximum(p_star_m, 0.0), 1.0)
 
-    rand_m  = tl.rand(seed, offsets)
+    rand_m  = tl.rand(seed_m, offsets)
     q_m_mag = floor_y_m + tl.where(rand_m < p_star_m, 1.0, 0.0)
     q_m_mag = tl.minimum(tl.maximum(q_m_mag, 0.0), 32767.0)
 
@@ -322,16 +325,10 @@ def _luma_requantize_kernel(
                          _safe_expm1(frac_w * delta_w_new) / z_w_new, 0.0)
     p_star_w  = tl.minimum(tl.maximum(p_star_w, 0.0), 1.0)
 
-    # Shift the seed (not the offset) to produce an independent PRNG
-    # stream — avoids int32 overflow of ``offsets + n_elements`` when
-    # a tensor has > 1 billion parameters.
-    rand_w  = tl.rand(seed ^ 0x3E3779B9, offsets)
+    rand_w  = tl.rand(seed_w, offsets)
     q_w_new = floor_y_w + tl.where(rand_w < p_star_w, 1.0, 0.0)
     q_w_new = tl.minimum(tl.maximum(q_w_new, 0.0), 65535.0)
 
-    # Route through int32 to get two's-complement bit-wrapping.
-    # Direct float→int16 in PTX (cvt.rzi.s16.f32) saturates at 32767,
-    # permanently losing the top half of the uint16 range.
     tl.store(q_w_ptr + offsets,
              q_w_new.to(tl.int32).to(tl.int16), mask=mask)
 
