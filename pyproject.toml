@@ -31,6 +31,8 @@ triton = ["triton>=3.0"]
 dev = [
     "pytest>=8.0",
     "setuptools>=68.0",
+    "tensorboard",
+    "torch-tb-profiler"
 ]
 
 [project.urls]
