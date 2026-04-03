@@ -29,7 +29,7 @@ from .config import SCALE_FLOOR_M, get_kernel_config
 
 # Triton back-end is optional (CUDA-only)
 try:
-    from .triton_kernel import luma_triton_step  # noqa: F401
+    from .triton_kernel import luma_triton_init_step, luma_triton_step  # noqa: F401
 
     _TRITON_AVAILABLE = True
 except (ImportError, RuntimeError):
@@ -58,6 +58,14 @@ class LUMA(Optimizer):
     backend : str
         ``"auto"`` | ``"triton"`` | ``"pytorch"``.
         *auto* selects Triton when CUDA + Triton are available.
+
+    Notes
+    -----
+    The Triton and PyTorch backends use different PRNG implementations
+    for stochastic rounding (Triton Philox vs ``torch.Generator``).
+    Both produce unbiased quantisation noise, but the exact noise
+    trajectories differ — cross-backend checkpoint loading preserves
+    correctness but not bitwise reproducibility.
     """
 
     def __init__(
@@ -83,7 +91,15 @@ class LUMA(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-        self._base_seed: int = int(torch.randint(0x7FFFFFFF, ()).item())
+        self._base_seed: int = int(
+            torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64).item()
+        )
+
+        if backend not in {"auto", "triton", "pytorch"}:
+            raise ValueError(
+                f"Invalid backend: {backend}. Expected one of "
+                f"{{'auto', 'triton', 'pytorch'}}."
+            )
 
         if backend == "auto":
             self._use_triton = _TRITON_AVAILABLE and torch.cuda.is_available()
@@ -216,7 +232,7 @@ class LUMA(Optimizer):
                 w_min, delta_m, _, delta_w, _ = F._precompute(S_m, S_v, eps)
                 exp_avg = F._decode_momentum(state["Q_m"], delta_m)
                 w = F._decode_preconditioner(state["Q_w"], w_min, delta_w)
-                exp_avg_sq = (1.0 / w - eps).square()
+                exp_avg_sq = (1.0 / w - eps).clamp(min=0).square()
 
                 adamw_state[pidx] = {
                     "step": torch.tensor(float(step)),
@@ -363,11 +379,11 @@ class LUMA(Optimizer):
         state["_s_v_block"] = torch.empty(
             num_blocks, device=p.device, dtype=torch.float32,
         )
-        # Step counter as int32 on GPU — survives CUDA Graph capture
+        # Step counter as int64 on GPU — survives CUDA Graph capture
         # (scalar Python args are baked at capture time) and avoids
         # the float32 precision ceiling at 2²⁴.
         state["_step_tensor"] = torch.tensor(
-            [step], device=p.device, dtype=torch.int32,
+            [step], device=p.device, dtype=torch.int64,
         )
 
     @staticmethod
@@ -442,26 +458,38 @@ class LUMA(Optimizer):
                 t = state["step"]
 
                 if t == 1:
-                    # First step: pure FP32 + seed delayed scales.
-                    # Always runs via PyTorch; use a seeded Generator
-                    # so that stochastic rounding is deterministic
-                    # across DDP ranks (given identical _base_seed).
-                    gen = self._get_generator(
-                        param.device,
-                        F._make_step_seed(self._base_seed, t, state["param_id"]),
-                    )
-                    Q_m, Q_w, S_m, S_v = F.luma_init_step(
-                        param, grad, beta1, beta2, eps, lr, wd,
-                        generator=gen,
-                    )
-                    state["Q_m"] = Q_m
-                    state["Q_w"] = Q_w
-
                     if self._use_triton and param.is_cuda:
+                        # Fused Triton init: zero full-parameter fp32 intermediates.
+                        state["Q_m"] = torch.empty_like(param, dtype=torch.int16)
+                        state["Q_w"] = torch.empty_like(param, dtype=torch.int16)
                         self._init_triton_buffers(
-                            state, param, S_m, S_v, beta1, beta2,
+                            state, param,
+                            SCALE_FLOOR_M, eps * eps,
+                            beta1, beta2,
                         )
+                        luma_triton_init_step(
+                            param, grad,
+                            state["Q_m"], state["Q_w"],
+                            state["_new_grid"],
+                            state["_s_m_block"], state["_s_v_block"],
+                            beta1, beta2, eps, lr, wd,
+                            state["param_id"],
+                            self._base_seed,
+                        )
+                        # S_m/S_v now live in _new_grid[0:2] — no CPU sync
                     else:
+                        # PyTorch fallback: seeded Generator for deterministic
+                        # stochastic rounding across DDP ranks.
+                        gen = self._get_generator(
+                            param.device,
+                            F._make_step_seed(self._base_seed, t, state["param_id"]),
+                        )
+                        Q_m, Q_w, S_m, S_v = F.luma_init_step(
+                            param, grad, beta1, beta2, eps, lr, wd,
+                            generator=gen,
+                        )
+                        state["Q_m"] = Q_m
+                        state["Q_w"] = Q_w
                         state["S_m"] = S_m
                         state["S_v"] = S_v
                 else:

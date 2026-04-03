@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from luma_optimizer import LUMA
+from utils import requires_cuda_triton
 
 
 # =====================================================================
@@ -28,6 +29,11 @@ class TestCreation:
             weight_decay=0.1,
         )
         assert opt.defaults["lr"] == 5e-4
+
+    def test_invalid_backend(self):
+        model = nn.Linear(8, 4)
+        with pytest.raises(ValueError, match="Invalid backend"):
+            LUMA(model.parameters(), backend="tritonn")
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -213,6 +219,34 @@ class TestStateDtypes:
             s = opt.state[p]
             assert s["Q_m"].device.type == device.type
             assert s["Q_w"].device.type == device.type
+
+
+@requires_cuda_triton
+class TestTritonValidation:
+    def test_noncontiguous_grad_rejected(self):
+        from luma_optimizer.config import get_kernel_config
+        from luma_optimizer.triton_kernel import luma_triton_init_step
+
+        param = torch.randn(8, 8, device="cuda")
+        grad = torch.randn(8, 8, device="cuda").transpose(0, 1)
+        Q_m = torch.empty_like(param, dtype=torch.int16)
+        Q_w = torch.empty_like(param, dtype=torch.int16)
+
+        kcfg = get_kernel_config(param.device)
+        num_blocks = (param.numel() + kcfg["BLOCK_SIZE"] - 1) // kcfg["BLOCK_SIZE"]
+        new_grid = torch.zeros(8, device="cuda")
+        s_m_block = torch.empty(num_blocks, device="cuda")
+        s_v_block = torch.empty(num_blocks, device="cuda")
+
+        with pytest.raises(ValueError, match="contiguous gradients"):
+            luma_triton_init_step(
+                param, grad,
+                Q_m, Q_w,
+                new_grid,
+                s_m_block, s_v_block,
+                0.9, 0.999, 1e-8, 1e-3, 0.01,
+                0, 42,
+            )
 
 
 # =====================================================================

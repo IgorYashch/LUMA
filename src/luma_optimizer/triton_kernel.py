@@ -1,7 +1,9 @@
-"""LUMA optimizer — Triton four-kernel implementation (CUDA only).
+"""LUMA optimizer — Triton kernel implementation (CUDA only).
 
-Fully asynchronous, CUDA-Graph-compatible pipeline with **zero CPU-GPU
-synchronization**:
+Fully asynchronous, CUDA-Graph-compatible pipelines with **zero CPU-GPU
+synchronization**.
+
+Steady-state step (t >= 2)::
 
     Kernel P  (precompute OLD grid + bias-correction scalars on GPU)
           ↓
@@ -11,9 +13,13 @@ synchronization**:
           ↓
     Kernel B  (re-decode + re-EMA + quantize with NEW grid)
 
-All four kernels are queued back-to-back.  No ``.item()`` calls.
-Per-step scalars (``eta_t``, ``bc2``, OLD grid constants) live entirely
-in GPU buffers, enabling ``torch.cuda.CUDAGraph`` capture.
+Init step (t = 1)::
+
+    Kernel I_A  (EMA from grad + param update + block-max tracking)
+          ↓
+    Kernel R    (reduce block maxima → compute NEW grid params)
+          ↓
+    Kernel I_B  (recompute m/v from grad + quantize with NEW grid)
 
 GPU buffer layouts
 ------------------
@@ -22,8 +28,8 @@ GPU buffer layouts
     [3] eta_t       [4] bc2          [5] bc1
     [6] (reserved)  [7] (reserved)
 
-``_step_tensor`` [1] int32  (incremented by Kernel P, read by Kernel B):
-    [0] step counter (limit 2³¹ ≈ 2.1 billion steps)
+``_step_tensor`` [1] int64  (incremented by Kernel P, read by Kernel B):
+    [0] step counter (limit 2⁶³)
 
 ``new_grid`` [8] float32  (written by Kernel R, read by Kernel B):
     [0] S_m_next   [1] S_v_next   [2] delta_m_new  [3] z_m_new
@@ -33,20 +39,13 @@ Numerical notes
 ---------------
 * ``log1p(x)`` and ``expm1(x)`` use inline 2-term Taylor expansions for
   ``|x| < 1e-5`` to avoid catastrophic cancellation in float32.
-  For larger arguments the standard ``tl.log`` / ``tl.exp`` paths are
-  used.  This eliminates the ``NaN``-producing ``0/0`` that occurs
-  when Δ_m ≈ 0 (e.g. ``S_m`` near the scale floor).
 * The PRNG uses Triton's built-in Philox generator seeded from
-  ``(step, param_id, base_seed)``.  ``base_seed`` is sampled from the
-  PyTorch global RNG at optimizer construction so that different
-  training runs produce different quantisation noise trajectories.
+  ``(step, param_id, base_seed)``.
 * The ``uint16`` preconditioner bins are stored via an ``int32``
   intermediate cast to guarantee two's-complement bit-wrapping
   (PTX ``cvt.rzi.s16.f32`` saturates floats > 32767).
-* The step counter lives in a dedicated ``int32`` GPU tensor
-  (``_step_tensor``), incremented by Kernel P on each step.  This
-  avoids the float32 precision ceiling at 2²⁴ and keeps the counter
-  inside the CUDA Graph (scalar Python args get baked at capture).
+* The step counter lives in a dedicated ``int64`` GPU tensor
+  (``_step_tensor``), incremented by Kernel P on each step.
 """
 
 from __future__ import annotations
@@ -58,13 +57,9 @@ import triton.language as tl
 from .config import K_M, K_W, SCALE_FLOOR_M, get_kernel_config
 
 
-# ── Numerically safe log1p / expm1 for Triton ────────────────────────
-#
-# Avoids catastrophic cancellation when the argument is tiny
-# (e.g. delta_m ≈ 3e-14 when S_m is at the scale floor).  The 2-term
-# Taylor expansion is accurate to ~1e-15 relative error for |x| < 1e-5,
-# well within float32 precision.
-
+# =====================================================================
+#  Numerically safe helpers
+# =====================================================================
 
 @triton.jit
 def _safe_log1p(x):
@@ -79,46 +74,107 @@ def _safe_expm1(x):
 
 
 # =====================================================================
+#  Shared quantization helper (used by Kernel B and Kernel I_B)
+# =====================================================================
+
+@triton.jit
+def _quantize_mv(
+    m_new, v_new,
+    q_m_ptr, q_w_ptr,
+    delta_m_new, z_m_new,
+    w_min_new, delta_w_new, z_w_new, w_max,
+    seed_m, seed_w,
+    eps, offsets, mask,
+):
+    """Quantize m_new/v_new to int16 Q_m/Q_w with log-space stochastic rounding.
+
+    Writes results in-place to q_m_ptr and q_w_ptr.
+    """
+    # ── Momentum ─────────────────────────────────────────────────────
+    m_abs = tl.abs(m_new)
+    y_m = _safe_log1p(m_abs) / delta_m_new
+    y_m = tl.minimum(y_m, 32767.0)
+
+    floor_y_m = tl.floor(y_m)
+    frac_m = y_m - floor_y_m
+    p_star_m = _safe_expm1(frac_m * delta_m_new) / z_m_new
+    p_star_m = tl.minimum(tl.maximum(p_star_m, 0.0), 1.0)
+
+    rand_m = tl.rand(seed_m, offsets)
+    q_m_mag = floor_y_m + tl.where(rand_m < p_star_m, 1.0, 0.0)
+    q_m_mag = tl.minimum(tl.maximum(q_m_mag, 0.0), 32767.0)
+
+    m_sign = tl.where(m_new > 0.0, 1.0, tl.where(m_new < 0.0, -1.0, 0.0))
+    tl.store(q_m_ptr + offsets, (m_sign * q_m_mag).to(tl.int16), mask=mask)
+
+    # ── Preconditioner ───────────────────────────────────────────────
+    w_new = 1.0 / (tl.sqrt(v_new) + eps)
+    w_clip = tl.minimum(tl.maximum(w_new, w_min_new), w_max)
+
+    y_w = tl.where(delta_w_new > 0.0,
+                   tl.log(w_clip / w_min_new) / delta_w_new, 0.0)
+    y_w = tl.minimum(y_w, 65535.0)
+
+    floor_y_w = tl.floor(y_w)
+    frac_w = y_w - floor_y_w
+    p_star_w = tl.where(delta_w_new > 0.0,
+                        _safe_expm1(frac_w * delta_w_new) / z_w_new, 0.0)
+    p_star_w = tl.minimum(tl.maximum(p_star_w, 0.0), 1.0)
+
+    rand_w = tl.rand(seed_w, offsets)
+    q_w_new = floor_y_w + tl.where(rand_w < p_star_w, 1.0, 0.0)
+    q_w_new = tl.minimum(tl.maximum(q_w_new, 0.0), 65535.0)
+
+    tl.store(q_w_ptr + offsets, q_w_new.to(tl.int32).to(tl.int16), mask=mask)
+
+
+@triton.jit
+def _decode_states(q_m_ptr, q_w_ptr, delta_m, delta_w, w_min, eps, offsets, mask):
+    """Decode int16 quantised states → FP32 (m, v)."""
+    q_m_i32 = tl.load(q_m_ptr + offsets, mask=mask, other=0).to(tl.int32)
+    q_w_i32 = tl.load(q_w_ptr + offsets, mask=mask, other=0).to(tl.int32)
+
+    q_m_abs = tl.abs(q_m_i32).to(tl.float32)
+    m_sign = tl.where(q_m_i32 > 0, 1.0, tl.where(q_m_i32 < 0, -1.0, 0.0))
+    m = m_sign * _safe_expm1(q_m_abs * delta_m)
+
+    q_w_unsigned = (q_w_i32 & 0xFFFF).to(tl.float32)
+    w = w_min * tl.exp(q_w_unsigned * delta_w)
+    v = (1.0 / w - eps) * (1.0 / w - eps)
+
+    return m, v
+
+
+# =====================================================================
 #  Kernel P — precompute per-step scalars on GPU
 # =====================================================================
 @triton.jit
 def _luma_precompute_kernel(
-    old_scalars_ptr,     # [8] float32 — read bc1/bc2, write [0:6]
-    new_grid_ptr,        # [8] float32 — read S_m ([0]), S_v ([1])
-    step_ptr,            # [1] int32   — incremented in-place
+    old_scalars_ptr, new_grid_ptr, step_ptr,
     beta1, beta2, eps, lr,
     K_M_VAL: tl.constexpr,
     K_W_VAL: tl.constexpr,
 ):
-    """Single-element kernel: increment step, update bias corrections, compute OLD grid.
-
-    Reads S_m/S_v from ``new_grid`` (the NEW grid of the *previous* step)
-    and computes the OLD grid constants needed by Kernel A and B.
-    """
-    # ── increment step counter (int32 — no float32 2²⁴ limit) ────────
+    """Single-element kernel: increment step, update bias corrections, compute OLD grid."""
     step_old = tl.load(step_ptr)
     tl.store(step_ptr, step_old + 1)
 
-    # ── read previous-step bias corrections ───────────────────────────
     bc1_old = tl.load(old_scalars_ptr + 5)
     bc2_old = tl.load(old_scalars_ptr + 4)
-
     S_m = tl.load(new_grid_ptr + 0)
     S_v = tl.load(new_grid_ptr + 1)
 
-    # ── bias correction recurrence: bc(t+1) = 1 - β·(1 - bc(t)) ─────
+    # Bias correction recurrence: equivalent to 1 - β^t in exact arithmetic.
+    # Float32 accumulates ~1 ULP/step — negligible in practice.
     bc1_new = 1.0 - beta1 + beta1 * bc1_old
     bc2_new = 1.0 - beta2 + beta2 * bc2_old
     eta_t = lr / bc1_new
 
-    # ── OLD quantisation grid from S_m, S_v ───────────────────────────
     w_min = 1.0 / (tl.sqrt(S_v) + eps)
     delta_m = _safe_log1p(S_m) / K_M_VAL
-    two_eps = 2.0 * eps
-    ratio = 1.0 / (two_eps * w_min)
+    ratio = 1.0 / (2.0 * eps * w_min)
     delta_w = tl.log(tl.maximum(ratio, 1.0)) / K_W_VAL
 
-    # ── store ─────────────────────────────────────────────────────────
     tl.store(old_scalars_ptr + 0, w_min)
     tl.store(old_scalars_ptr + 1, delta_m)
     tl.store(old_scalars_ptr + 2, delta_w)
@@ -132,10 +188,8 @@ def _luma_precompute_kernel(
 # =====================================================================
 @triton.jit
 def _luma_decode_update_kernel(
-    param_ptr, grad_ptr,
-    q_m_ptr, q_w_ptr,
-    s_m_block_ptr, s_v_block_ptr,
-    old_scalars_ptr,      # per-step scalars from Kernel P
+    param_ptr, grad_ptr, q_m_ptr, q_w_ptr,
+    s_m_block_ptr, s_v_block_ptr, old_scalars_ptr,
     beta1, beta2, eps, lr, weight_decay,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
@@ -144,41 +198,23 @@ def _luma_decode_update_kernel(
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # ── per-step scalars from GPU buffer ──────────────────────────────
     w_min   = tl.load(old_scalars_ptr + 0)
     delta_m = tl.load(old_scalars_ptr + 1)
     delta_w = tl.load(old_scalars_ptr + 2)
     eta_t   = tl.load(old_scalars_ptr + 3)
     bc2     = tl.load(old_scalars_ptr + 4)
 
-    # ── Load from HBM ────────────────────────────────────────────────
-    param   = tl.load(param_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    grad    = tl.load(grad_ptr  + offsets, mask=mask, other=0.0).to(tl.float32)
-    q_m_i32 = tl.load(q_m_ptr  + offsets, mask=mask, other=0).to(tl.int32)
-    q_w_i32 = tl.load(q_w_ptr  + offsets, mask=mask, other=0).to(tl.int32)
+    param = tl.load(param_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    grad  = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    m, v = _decode_states(q_m_ptr, q_w_ptr, delta_m, delta_w, w_min, eps, offsets, mask)
 
-    # ── 1. Decode quantised states → FP32 ────────────────────────────
-    q_m_abs = tl.abs(q_m_i32).to(tl.float32)
-    m_sign  = tl.where(q_m_i32 > 0, 1.0,
-                       tl.where(q_m_i32 < 0, -1.0, 0.0))
-    m = m_sign * _safe_expm1(q_m_abs * delta_m)
-
-    q_w_unsigned = (q_w_i32 & 0xFFFF).to(tl.float32)
-    w     = w_min * tl.exp(q_w_unsigned * delta_w)
-    inv_w = 1.0 / w
-    v     = (inv_w - eps) * (inv_w - eps)
-
-    # ── 2. EMA update ────────────────────────────────────────────────
     m_new = beta1 * m + (1.0 - beta1) * grad
-    v_new = tl.maximum(beta2 * v + (1.0 - beta2) * grad * grad,
-                       eps * eps)
+    v_new = tl.maximum(beta2 * v + (1.0 - beta2) * grad * grad, eps * eps)
 
-    # ── 3. Parameter update (AdamW) ──────────────────────────────────
     denom = tl.sqrt(v_new / bc2) + eps
     param = param * (1.0 - weight_decay * lr) - eta_t * m_new / denom
     tl.store(param_ptr + offsets, param, mask=mask)
 
-    # ── 4. Block-level scale tracking ────────────────────────────────
     abs_m_safe = tl.where(mask, tl.abs(m_new), 0.0)
     v_new_safe = tl.where(mask, v_new, 0.0)
     tl.store(s_m_block_ptr + pid, tl.max(abs_m_safe, axis=0))
@@ -190,10 +226,8 @@ def _luma_decode_update_kernel(
 # =====================================================================
 @triton.jit
 def _luma_reduce_grid_kernel(
-    s_m_block_ptr, s_v_block_ptr,
-    new_grid_ptr,
-    num_blocks,
-    scale_floor_m, eps,
+    s_m_block_ptr, s_v_block_ptr, new_grid_ptr,
+    num_blocks, scale_floor_m, eps,
     K_M_VAL: tl.constexpr,
     K_W_VAL: tl.constexpr,
     REDUCE_BLOCK: tl.constexpr,
@@ -204,23 +238,22 @@ def _luma_reduce_grid_kernel(
 
     for start in range(0, num_blocks, REDUCE_BLOCK):
         offsets = start + tl.arange(0, REDUCE_BLOCK)
-        mask = offsets < num_blocks
+        rmask = offsets < num_blocks
         max_m_vec = tl.maximum(max_m_vec,
-                               tl.load(s_m_block_ptr + offsets, mask=mask, other=0.0))
+                               tl.load(s_m_block_ptr + offsets, mask=rmask, other=0.0))
         max_v_vec = tl.maximum(max_v_vec,
-                               tl.load(s_v_block_ptr + offsets, mask=mask, other=0.0))
+                               tl.load(s_v_block_ptr + offsets, mask=rmask, other=0.0))
 
     S_m = tl.maximum(tl.max(max_m_vec, axis=0), scale_floor_m)
     S_v = tl.maximum(tl.max(max_v_vec, axis=0), eps * eps)
 
+    two_eps = 2.0 * eps
     w_min   = 1.0 / (tl.sqrt(S_v) + eps)
     delta_m = _safe_log1p(S_m) / K_M_VAL
     z_m     = _safe_expm1(delta_m)
-    two_eps = 2.0 * eps
     ratio   = 1.0 / (two_eps * w_min)
     delta_w = tl.log(tl.maximum(ratio, 1.0)) / K_W_VAL
     z_w     = tl.where(delta_w > 0.0, _safe_expm1(delta_w), 1.0)
-    w_max   = 1.0 / two_eps
 
     tl.store(new_grid_ptr + 0, S_m)
     tl.store(new_grid_ptr + 1, S_v)
@@ -229,7 +262,7 @@ def _luma_reduce_grid_kernel(
     tl.store(new_grid_ptr + 4, w_min)
     tl.store(new_grid_ptr + 5, delta_w)
     tl.store(new_grid_ptr + 6, z_w)
-    tl.store(new_grid_ptr + 7, w_max)
+    tl.store(new_grid_ptr + 7, 1.0 / two_eps)  # w_max
 
 
 # =====================================================================
@@ -238,12 +271,9 @@ def _luma_reduce_grid_kernel(
 @triton.jit
 def _luma_requantize_kernel(
     grad_ptr, q_m_ptr, q_w_ptr,
-    old_scalars_ptr,      # OLD grid [0:3]
-    new_grid_ptr,         # NEW grid [2:8]
-    step_ptr,             # [1] int32 — step counter on GPU
+    old_scalars_ptr, new_grid_ptr, step_ptr,
     beta1, beta2, eps,
-    param_id,             # constant scalar — for PRNG seed
-    base_seed,            # from optimizer torch RNG — varies across runs
+    param_id, base_seed,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -251,12 +281,12 @@ def _luma_requantize_kernel(
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # ── OLD grid from Kernel P ────────────────────────────────────────
+    # OLD grid
     w_min_old   = tl.load(old_scalars_ptr + 0)
     delta_m_old = tl.load(old_scalars_ptr + 1)
     delta_w_old = tl.load(old_scalars_ptr + 2)
 
-    # ── NEW grid from Kernel R ────────────────────────────────────────
+    # NEW grid
     delta_m_new = tl.load(new_grid_ptr + 2)
     z_m_new     = tl.load(new_grid_ptr + 3)
     w_min_new   = tl.load(new_grid_ptr + 4)
@@ -264,78 +294,158 @@ def _luma_requantize_kernel(
     z_w_new     = tl.load(new_grid_ptr + 6)
     w_max       = tl.load(new_grid_ptr + 7)
 
-    # ── deterministic PRNG seed from (step, param_id, base_seed) ─────
+    # PRNG seeds
     step_64 = tl.load(step_ptr).to(tl.int64)
-    param_id_64 = param_id.to(tl.int64)
-    base_seed_64 = base_seed.to(tl.int64)
-    seed_m = ((step_64 << 32) | (param_id_64 * 2)) ^ base_seed_64
-    seed_w = ((step_64 << 32) | (param_id_64 * 2 + 1)) ^ base_seed_64
+    pid_64 = param_id.to(tl.int64)
+    bs_64 = base_seed.to(tl.int64)
+    seed_m = ((step_64 << 32) | (pid_64 * 2)) ^ bs_64
+    seed_w = ((step_64 << 32) | (pid_64 * 2 + 1)) ^ bs_64
 
-    # ── Load grad + OLD quantised states ─────────────────────────────
-    grad    = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    q_m_i32 = tl.load(q_m_ptr + offsets, mask=mask, other=0).to(tl.int32)
-    q_w_i32 = tl.load(q_w_ptr + offsets, mask=mask, other=0).to(tl.int32)
-
-    # ── Re-decode with OLD grid ──────────────────────────────────────
-    q_m_abs = tl.abs(q_m_i32).to(tl.float32)
-    m_sign  = tl.where(q_m_i32 > 0, 1.0,
-                       tl.where(q_m_i32 < 0, -1.0, 0.0))
-    m = m_sign * _safe_expm1(q_m_abs * delta_m_old)
-
-    q_w_unsigned = (q_w_i32 & 0xFFFF).to(tl.float32)
-    w     = w_min_old * tl.exp(q_w_unsigned * delta_w_old)
-    inv_w = 1.0 / w
-    v     = (inv_w - eps) * (inv_w - eps)
-
-    # ── Re-compute EMA (free ALU hidden behind HBM latency) ──────────
+    # Re-decode with OLD grid, re-compute EMA
+    grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    m, v = _decode_states(q_m_ptr, q_w_ptr, delta_m_old, delta_w_old, w_min_old, eps, offsets, mask)
     m_new = beta1 * m + (1.0 - beta1) * grad
-    v_new = tl.maximum(beta2 * v + (1.0 - beta2) * grad * grad,
-                       eps * eps)
+    v_new = tl.maximum(beta2 * v + (1.0 - beta2) * grad * grad, eps * eps)
 
-    # ── Quantise momentum with NEW grid ──────────────────────────────
-    m_abs = tl.abs(m_new)
-    y_m = _safe_log1p(m_abs) / delta_m_new
-    y_m = tl.minimum(y_m, 32767.0)
-
-    floor_y_m = tl.floor(y_m)
-    frac_m    = y_m - floor_y_m
-    p_star_m  = _safe_expm1(frac_m * delta_m_new) / z_m_new
-    p_star_m  = tl.minimum(tl.maximum(p_star_m, 0.0), 1.0)
-
-    rand_m  = tl.rand(seed_m, offsets)
-    q_m_mag = floor_y_m + tl.where(rand_m < p_star_m, 1.0, 0.0)
-    q_m_mag = tl.minimum(tl.maximum(q_m_mag, 0.0), 32767.0)
-
-    m_sign_new = tl.where(m_new > 0.0, 1.0,
-                          tl.where(m_new < 0.0, -1.0, 0.0))
-    tl.store(q_m_ptr + offsets,
-             (m_sign_new * q_m_mag).to(tl.int16), mask=mask)
-
-    # ── Quantise preconditioner with NEW grid ────────────────────────
-    w_new  = 1.0 / (tl.sqrt(v_new) + eps)
-    w_clip = tl.minimum(tl.maximum(w_new, w_min_new), w_max)
-
-    y_w = tl.where(delta_w_new > 0.0,
-                   tl.log(w_clip / w_min_new) / delta_w_new, 0.0)
-    y_w = tl.minimum(y_w, 65535.0)
-
-    floor_y_w = tl.floor(y_w)
-    frac_w    = y_w - floor_y_w
-    p_star_w  = tl.where(delta_w_new > 0.0,
-                         _safe_expm1(frac_w * delta_w_new) / z_w_new, 0.0)
-    p_star_w  = tl.minimum(tl.maximum(p_star_w, 0.0), 1.0)
-
-    rand_w  = tl.rand(seed_w, offsets)
-    q_w_new = floor_y_w + tl.where(rand_w < p_star_w, 1.0, 0.0)
-    q_w_new = tl.minimum(tl.maximum(q_w_new, 0.0), 65535.0)
-
-    tl.store(q_w_ptr + offsets,
-             q_w_new.to(tl.int32).to(tl.int16), mask=mask)
+    _quantize_mv(m_new, v_new, q_m_ptr, q_w_ptr,
+                 delta_m_new, z_m_new, w_min_new, delta_w_new, z_w_new, w_max,
+                 seed_m, seed_w, eps, offsets, mask)
 
 
 # =====================================================================
-#  Python wrapper — four fully-async launches, zero CPU-GPU sync
+#  Init Kernel I_A — compute m/v from grad, param update, block maxima
 # =====================================================================
+@triton.jit
+def _luma_init_update_kernel(
+    param_ptr, grad_ptr, s_m_block_ptr, s_v_block_ptr,
+    beta1, beta2, eps, lr, weight_decay,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Step-1: compute m/v from gradient, update param, track block maxima."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    param = tl.load(param_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    grad  = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    m_new = (1.0 - beta1) * grad
+    v_new = tl.maximum((1.0 - beta2) * grad * grad, eps * eps)
+
+    bc1 = 1.0 - beta1
+    bc2 = 1.0 - beta2
+    denom = tl.sqrt(v_new / bc2) + eps
+    param = param * (1.0 - weight_decay * lr) - (lr / bc1) * m_new / denom
+    tl.store(param_ptr + offsets, param, mask=mask)
+
+    abs_m_safe = tl.where(mask, tl.abs(m_new), 0.0)
+    v_new_safe = tl.where(mask, v_new, 0.0)
+    tl.store(s_m_block_ptr + pid, tl.max(abs_m_safe, axis=0))
+    tl.store(s_v_block_ptr + pid, tl.max(v_new_safe, axis=0))
+
+
+# =====================================================================
+#  Init Kernel I_B — recompute m/v from grad, quantize with NEW grid
+# =====================================================================
+@triton.jit
+def _luma_init_quantize_kernel(
+    grad_ptr, q_m_ptr, q_w_ptr, new_grid_ptr,
+    beta1, beta2, eps,
+    param_id, base_seed,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Step-1: recompute m/v from grad, quantize with NEW grid."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # NEW grid
+    delta_m_new = tl.load(new_grid_ptr + 2)
+    z_m_new     = tl.load(new_grid_ptr + 3)
+    w_min_new   = tl.load(new_grid_ptr + 4)
+    delta_w_new = tl.load(new_grid_ptr + 5)
+    z_w_new     = tl.load(new_grid_ptr + 6)
+    w_max       = tl.load(new_grid_ptr + 7)
+
+    # PRNG seeds (step = 1 for init)
+    pid_64 = param_id.to(tl.int64)
+    bs_64 = base_seed.to(tl.int64)
+    step_1 = tl.full([], 1, dtype=tl.int64)
+    seed_m = ((step_1 << 32) | (pid_64 * 2)) ^ bs_64
+    seed_w = ((step_1 << 32) | (pid_64 * 2 + 1)) ^ bs_64
+
+    # Recompute m/v from grad
+    grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    m_new = (1.0 - beta1) * grad
+    v_new = tl.maximum((1.0 - beta2) * grad * grad, eps * eps)
+
+    _quantize_mv(m_new, v_new, q_m_ptr, q_w_ptr,
+                 delta_m_new, z_m_new, w_min_new, delta_w_new, z_w_new, w_max,
+                 seed_m, seed_w, eps, offsets, mask)
+
+
+# =====================================================================
+#  Python wrappers
+# =====================================================================
+
+def _prepare_launch(param, grad):
+    """Validate inputs and return (n, kernel_config, num_blocks)."""
+    if param.dtype != torch.float32:
+        raise ValueError(
+            f"LUMA Triton kernel requires float32 parameters (got {param.dtype})"
+        )
+    if not param.is_contiguous():
+        raise ValueError("LUMA Triton kernel requires contiguous parameters")
+    if not grad.is_contiguous():
+        raise ValueError("LUMA Triton kernel requires contiguous gradients")
+    n = param.numel()
+    kcfg = get_kernel_config(param.device)
+    bs = kcfg["BLOCK_SIZE"]
+    num_blocks = (n + bs - 1) // bs
+    return grad, n, kcfg, num_blocks
+
+
+def luma_triton_init_step(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    Q_m: torch.Tensor,
+    Q_w: torch.Tensor,
+    new_grid: torch.Tensor,
+    s_m_block: torch.Tensor,
+    s_v_block: torch.Tensor,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    lr: float,
+    weight_decay: float,
+    param_id: int,
+    base_seed: int,
+) -> None:
+    """Three-kernel fused Triton init step.  Zero CPU-GPU sync.
+
+    Pipeline: I_A (update + block-max) → R (reduce) → I_B (quantize).
+    """
+    grad, n, kcfg, num_blocks = _prepare_launch(param, grad)
+    BS = kcfg["BLOCK_SIZE"]
+    kw = dict(num_warps=kcfg["num_warps"], num_stages=kcfg["num_stages"])
+
+    _luma_init_update_kernel[(num_blocks,)](
+        param, grad, s_m_block, s_v_block,
+        beta1, beta2, eps, lr, weight_decay, n,
+        BLOCK_SIZE=BS, **kw,
+    )
+    _luma_reduce_grid_kernel[(1,)](
+        s_m_block, s_v_block, new_grid, num_blocks,
+        SCALE_FLOOR_M, eps, K_M_VAL=K_M, K_W_VAL=K_W, REDUCE_BLOCK=1024,
+    )
+    _luma_init_quantize_kernel[(num_blocks,)](
+        grad, Q_m, Q_w, new_grid,
+        beta1, beta2, eps, param_id, base_seed, n,
+        BLOCK_SIZE=BS, **kw,
+    )
+
 
 def luma_triton_step(
     param: torch.Tensor,
@@ -355,68 +465,29 @@ def luma_triton_step(
     step_tensor: torch.Tensor,
     base_seed: int,
 ) -> None:
-    """Four-kernel fused Triton step.  CUDA-Graph-compatible.
+    """Four-kernel fused Triton step.  Zero CPU-GPU sync.
 
-    Modifies *param*, *Q_m*, *Q_w*, *old_scalars*, *new_grid* **in-place**.
-    ``S_m_next`` and ``S_v_next`` are available in ``new_grid[0:2]`` after
-    the kernels complete (no CPU readback needed).
-
-    All four kernels (P → A → R → B) are queued without any CPU-GPU
-    synchronisation, making the call compatible with
-    ``torch.cuda.CUDAGraph`` capture.
+    Pipeline: P (precompute) → A (update + block-max) → R (reduce) → B (quantize).
     """
-    if param.dtype != torch.float32:
-        raise ValueError(
-            f"LUMA Triton kernel requires float32 parameters (got {param.dtype})"
-        )
-    if not param.is_contiguous():
-        raise ValueError("LUMA Triton kernel requires contiguous parameters")
-    grad = grad.contiguous()
+    grad, n, kcfg, num_blocks = _prepare_launch(param, grad)
+    BS = kcfg["BLOCK_SIZE"]
+    kw = dict(num_warps=kcfg["num_warps"], num_stages=kcfg["num_stages"])
 
-    n = param.numel()
-    kcfg = get_kernel_config(param.device)
-    BLOCK_SIZE = kcfg["BLOCK_SIZE"]
-    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
-
-    # ── Kernel P: precompute per-step scalars (async) ─────────────────
     _luma_precompute_kernel[(1,)](
         old_scalars, new_grid, step_tensor,
-        beta1, beta2, eps, lr,
-        K_M_VAL=K_M,
-        K_W_VAL=K_W,
+        beta1, beta2, eps, lr, K_M_VAL=K_M, K_W_VAL=K_W,
     )
-
-    # ── Kernel A: decode + update + block maxima (async) ──────────────
     _luma_decode_update_kernel[(num_blocks,)](
-        param, grad, Q_m, Q_w,
-        s_m_block, s_v_block,
-        old_scalars,
-        beta1, beta2, eps, lr, weight_decay,
-        n,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=kcfg["num_warps"],
-        num_stages=kcfg["num_stages"],
+        param, grad, Q_m, Q_w, s_m_block, s_v_block, old_scalars,
+        beta1, beta2, eps, lr, weight_decay, n,
+        BLOCK_SIZE=BS, **kw,
     )
-
-    # ── Kernel R: reduce block maxima → new grid params (async) ───────
     _luma_reduce_grid_kernel[(1,)](
-        s_m_block, s_v_block,
-        new_grid,
-        num_blocks,
-        SCALE_FLOOR_M, eps,
-        K_M_VAL=K_M,
-        K_W_VAL=K_W,
-        REDUCE_BLOCK=1024,
+        s_m_block, s_v_block, new_grid, num_blocks,
+        SCALE_FLOOR_M, eps, K_M_VAL=K_M, K_W_VAL=K_W, REDUCE_BLOCK=1024,
     )
-
-    # ── Kernel B: recompute + quantize with NEW grid (async) ──────────
     _luma_requantize_kernel[(num_blocks,)](
-        grad, Q_m, Q_w,
-        old_scalars, new_grid, step_tensor,
-        beta1, beta2, eps,
-        param_id, base_seed,
-        n,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=kcfg["num_warps"],
-        num_stages=kcfg["num_stages"],
+        grad, Q_m, Q_w, old_scalars, new_grid, step_tensor,
+        beta1, beta2, eps, param_id, base_seed, n,
+        BLOCK_SIZE=BS, **kw,
     )

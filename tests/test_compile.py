@@ -42,13 +42,37 @@ def _make_triton_buffers(n: int, device: str = "cuda"):
 
     s_m_block = torch.empty(num_blocks, device=device)
     s_v_block = torch.empty(num_blocks, device=device)
-    step_tensor = torch.tensor([1], device=device, dtype=torch.int32)
+    step_tensor = torch.tensor([1], device=device, dtype=torch.int64)
 
     return dict(
         param=param, grad=grad, Q_m=Q_m, Q_w=Q_w,
         old_scalars=old_scalars, new_grid=new_grid,
         s_m_block=s_m_block, s_v_block=s_v_block,
         step_tensor=step_tensor,
+    )
+
+
+def _make_triton_init_buffers(n: int, device: str = "cuda"):
+    """Allocate all tensors needed by ``luma_triton_init_step``."""
+    from luma_optimizer.config import get_kernel_config
+
+    kcfg = get_kernel_config(torch.device(device))
+    block_size = kcfg["BLOCK_SIZE"]
+    num_blocks = (n + block_size - 1) // block_size
+
+    param = torch.randn(n, device=device)
+    grad = torch.randn(n, device=device)
+    Q_m = torch.empty(n, device=device, dtype=torch.int16)
+    Q_w = torch.empty(n, device=device, dtype=torch.int16)
+
+    new_grid = torch.zeros(8, device=device)
+    s_m_block = torch.empty(num_blocks, device=device)
+    s_v_block = torch.empty(num_blocks, device=device)
+
+    return dict(
+        param=param, grad=grad, Q_m=Q_m, Q_w=Q_w,
+        new_grid=new_grid,
+        s_m_block=s_m_block, s_v_block=s_v_block,
     )
 
 
@@ -216,3 +240,51 @@ class TestCompiledTrainingLoop:
 
         for p in model.parameters():
             assert p.isfinite().all()
+
+
+# =====================================================================
+#  Triton init kernel compile tests
+# =====================================================================
+
+
+@requires_cuda_triton
+class TestTritonInitCompile:
+    """luma_triton_init_step must be torch.compile-able with fullgraph=True."""
+
+    def test_init_compiles_without_graph_breaks(self):
+        from luma_optimizer.triton_kernel import luma_triton_init_step
+
+        bufs = _make_triton_init_buffers(4096)
+        param_before = bufs["param"].clone()
+
+        compiled_init = torch.compile(luma_triton_init_step, fullgraph=True)
+        compiled_init(
+            bufs["param"], bufs["grad"], bufs["Q_m"], bufs["Q_w"],
+            bufs["new_grid"],
+            bufs["s_m_block"], bufs["s_v_block"],
+            0.9, 0.999, 1e-8, 1e-3, 0.01,
+            0, 42,
+        )
+        torch.cuda.synchronize()
+
+        assert not torch.equal(bufs["param"], param_before), (
+            "Parameters should have been updated"
+        )
+        assert bufs["param"].isfinite().all(), "Parameters must be finite"
+
+    def test_init_zero_graph_breaks(self):
+        from luma_optimizer.triton_kernel import luma_triton_init_step
+
+        bufs = _make_triton_init_buffers(4096)
+        explanation = torch._dynamo.explain(luma_triton_init_step)(
+            bufs["param"], bufs["grad"], bufs["Q_m"], bufs["Q_w"],
+            bufs["new_grid"],
+            bufs["s_m_block"], bufs["s_v_block"],
+            0.9, 0.999, 1e-8, 1e-3, 0.01,
+            0, 42,
+        )
+        torch.cuda.synchronize()
+        assert explanation.graph_break_count == 0, (
+            f"Expected 0 graph breaks, got {explanation.graph_break_count}.\n"
+            f"Break reasons:\n{explanation.break_reasons}"
+        )

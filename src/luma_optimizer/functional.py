@@ -97,13 +97,13 @@ def _precompute(
 # ---------------------------------------------------------------------------
 
 def _make_step_seed(base_seed: int, step: int, param_id: int) -> int:
-    """Return a deterministic 31-bit seed for stochastic rounding.
+    """Return a deterministic 64-bit seed for stochastic rounding.
 
-    Uses the same LCG-XOR formula as Triton kernel B so that,
+    Uses a mixing formula similar to Triton kernel B so that,
     given identical ``(base_seed, step, param_id)``, both backends
     produce a reproducible (though not identical) PRNG stream.
     """
-    return ((step * 1103515245 + base_seed) ^ (param_id * 22695477)) & 0x7FFFFFFF
+    return ((step << 32) | (param_id * 2)) ^ base_seed
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +203,7 @@ def luma_init_step(
     # ── raw EMA from zero-init ──────────────────────────────────────────
     m = (1.0 - beta1) * grad_fp32
     v = ((1.0 - beta2) * grad_fp32.square()).clamp(min=eps * eps)
+    del grad_fp32
 
     # ── bias-corrected parameter update  (step = 1) ────────────────────
     bc1 = 1.0 - beta1
@@ -212,14 +213,17 @@ def luma_init_step(
     param.mul_(1.0 - lr * weight_decay)
     param.addcdiv_(m, (v / bc2).sqrt().add_(eps), value=-eta_t)
 
-    # ── seed delayed scales ─────────────────────────────────────────────
-    S_m: float = max(m.abs().max().item(), SCALE_FLOOR_M)
-    S_v: float = max(v.max().item(), eps * eps)
+    # ── seed delayed scales (single CPU-GPU sync) ──────────────────────
+    S_m_t, S_v_t = torch.stack([m.abs().max(), v.max()]).tolist()
+    S_m: float = max(S_m_t, SCALE_FLOOR_M)
+    S_v: float = max(S_v_t, eps * eps)
 
     # ── quantise ────────────────────────────────────────────────────────
     w_min, delta_m, z_m, delta_w, z_w = _precompute(S_m, S_v, eps)
     Q_m = _quantize_momentum(m, S_m, delta_m, z_m, generator=generator)
+    del m
     Q_w = _quantize_preconditioner(v, eps, w_min, delta_w, z_w, generator=generator)
+    del v
 
     return Q_m, Q_w, S_m, S_v
 
@@ -264,17 +268,20 @@ def luma_update_step(
     m = _decode_momentum(Q_m, delta_m)
     w = _decode_preconditioner(Q_w, w_min, delta_w)
     v = (1.0 / w - eps).square()
+    del w
 
     # ── 2. EMA + param update (exact PyTorch AdamW) ─────────────────────
     m_new = beta1 * m + (1.0 - beta1) * grad_fp32
     v_new = (beta2 * v + (1.0 - beta2) * grad_fp32.square()).clamp(min=eps * eps)
+    del m, v, grad_fp32
 
     param.mul_(1.0 - weight_decay * lr)
     param.addcdiv_(m_new, (v_new / bc2).sqrt().add_(eps), value=-eta_t)
 
-    # ── 3. track new scales ─────────────────────────────────────────────
-    S_m_next: float = max(m_new.abs().max().item(), SCALE_FLOOR_M)
-    S_v_next: float = max(v_new.max().item(), eps * eps)
+    # ── 3. track new scales (single CPU-GPU sync) ──────────────────────
+    S_m_t, S_v_t = torch.stack([m_new.abs().max(), v_new.max()]).tolist()
+    S_m_next: float = max(S_m_t, SCALE_FLOOR_M)
+    S_v_next: float = max(S_v_t, eps * eps)
 
     # ── 4. re-quantise with NEW matched scales (in-place) ───────────────
     #   Two-pass: we already know S_m_next/S_v_next, so we build the NEW
@@ -284,6 +291,8 @@ def luma_update_step(
         S_m_next, S_v_next, eps,
     )
     _quantize_momentum(m_new, S_m_next, delta_m_new, z_m_new, out=Q_m, generator=generator)
+    del m_new
     _quantize_preconditioner(v_new, eps, w_min_new, delta_w_new, z_w_new, out=Q_w, generator=generator)
+    del v_new
 
     return S_m_next, S_v_next
