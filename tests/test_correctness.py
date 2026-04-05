@@ -15,6 +15,7 @@ from luma_optimizer.functional import (
     _encode_uint16,
     _log_sr,
     _precompute,
+    _quantize_preconditioner,
 )
 from utils import requires_cuda_triton
 
@@ -83,7 +84,7 @@ class TestLogSR:
     def test_preconditioner_unbiased(self, frac, device):
         S_v, eps = 1.0, 1e-8
         w_min = 1.0 / (math.sqrt(S_v) + eps)
-        w_max = 1.0 / (2.0 * eps)
+        w_max = 1.0 / eps
         delta_w = math.log(w_max / w_min) / K_W
         z_w = math.expm1(delta_w)
         w_test = w_min + frac * (w_max - w_min)
@@ -144,7 +145,7 @@ class TestDecodePreconditioner:
         eps = 1e-8
         S_v = 1.0
         w_min, _, _, delta_w, _ = _precompute(1.0, S_v, eps)
-        w_max = 1.0 / (2.0 * eps)
+        w_max = 1.0 / eps
 
         q_lo = _encode_uint16(torch.tensor([0], dtype=torch.int32)).to(device)
         q_hi = _encode_uint16(torch.tensor([K_W], dtype=torch.int32)).to(device)
@@ -154,6 +155,17 @@ class TestDecodePreconditioner:
         assert _decode_preconditioner(q_hi, w_min, delta_w).item() == pytest.approx(
             w_max, rel=1e-3
         )
+
+    def test_zero_variance_exact(self, device):
+        eps = 1e-8
+        v = torch.zeros(16, device=device)
+        w_min, _, _, delta_w, z_w = _precompute(1.0, 0.0, eps)
+
+        q_w = _quantize_preconditioner(v, eps, w_min, delta_w, z_w)
+        decoded = _decode_preconditioner(q_w, w_min, delta_w)
+
+        assert delta_w == pytest.approx(0.0)
+        assert torch.allclose(decoded, torch.full_like(decoded, 1.0 / eps))
 
 
 # ── tracking fidelity vs FP32 AdamW ───────────────────────────────────────

@@ -305,11 +305,11 @@ class LUMA(Optimizer):
             param = self._unwrap_tensor(p)
             device = param.device if param is not None else p.device
             m = adamw_state["exp_avg"].to(device).float()
-            v = adamw_state["exp_avg_sq"].to(device).float().clamp(min=eps * eps)
+            v = adamw_state["exp_avg_sq"].to(device).float().clamp(min=0.0)
 
             # Compute delayed scales
             S_m: float = max(m.abs().max().item(), SCALE_FLOOR_M)
-            S_v: float = max(v.max().item(), eps * eps)
+            S_v: float = max(v.max().item(), 0.0)
 
             # Quantise onto LUMA grid (deterministic stochastic rounding)
             gen = self._get_generator(
@@ -464,7 +464,7 @@ class LUMA(Optimizer):
                         state["Q_w"] = torch.empty_like(param, dtype=torch.int16)
                         self._init_triton_buffers(
                             state, param,
-                            SCALE_FLOOR_M, eps * eps,
+                            SCALE_FLOOR_M, 0.0,
                             beta1, beta2,
                         )
                         luma_triton_init_step(

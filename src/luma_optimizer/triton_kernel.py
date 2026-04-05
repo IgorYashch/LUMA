@@ -108,7 +108,7 @@ def _quantize_mv(
     tl.store(q_m_ptr + offsets, (m_sign * q_m_mag).to(tl.int16), mask=mask)
 
     # ── Preconditioner ───────────────────────────────────────────────
-    w_new = 1.0 / (tl.sqrt(v_new) + eps)
+    w_new = 1.0 / (tl.sqrt(tl.maximum(v_new, 0.0)) + eps)
     w_clip = tl.minimum(tl.maximum(w_new, w_min_new), w_max)
 
     y_w = tl.where(delta_w_new > 0.0,
@@ -140,7 +140,8 @@ def _decode_states(q_m_ptr, q_w_ptr, delta_m, delta_w, w_min, eps, offsets, mask
 
     q_w_unsigned = (q_w_i32 & 0xFFFF).to(tl.float32)
     w = w_min * tl.exp(q_w_unsigned * delta_w)
-    v = (1.0 / w - eps) * (1.0 / w - eps)
+    v_delta = tl.maximum(1.0 / w - eps, 0.0)
+    v = v_delta * v_delta
 
     return m, v
 
@@ -172,7 +173,7 @@ def _luma_precompute_kernel(
 
     w_min = 1.0 / (tl.sqrt(S_v) + eps)
     delta_m = _safe_log1p(S_m) / K_M_VAL
-    ratio = 1.0 / (2.0 * eps * w_min)
+    ratio = 1.0 / (eps * w_min)
     delta_w = tl.log(tl.maximum(ratio, 1.0)) / K_W_VAL
 
     tl.store(old_scalars_ptr + 0, w_min)
@@ -209,7 +210,7 @@ def _luma_decode_update_kernel(
     m, v = _decode_states(q_m_ptr, q_w_ptr, delta_m, delta_w, w_min, eps, offsets, mask)
 
     m_new = beta1 * m + (1.0 - beta1) * grad
-    v_new = tl.maximum(beta2 * v + (1.0 - beta2) * grad * grad, eps * eps)
+    v_new = beta2 * v + (1.0 - beta2) * grad * grad
 
     denom = tl.sqrt(v_new / bc2) + eps
     param = param * (1.0 - weight_decay * lr) - eta_t * m_new / denom
@@ -245,13 +246,11 @@ def _luma_reduce_grid_kernel(
                                tl.load(s_v_block_ptr + offsets, mask=rmask, other=0.0))
 
     S_m = tl.maximum(tl.max(max_m_vec, axis=0), scale_floor_m)
-    S_v = tl.maximum(tl.max(max_v_vec, axis=0), eps * eps)
-
-    two_eps = 2.0 * eps
+    S_v = tl.maximum(tl.max(max_v_vec, axis=0), 0.0)
     w_min   = 1.0 / (tl.sqrt(S_v) + eps)
     delta_m = _safe_log1p(S_m) / K_M_VAL
     z_m     = _safe_expm1(delta_m)
-    ratio   = 1.0 / (two_eps * w_min)
+    ratio   = 1.0 / (eps * w_min)
     delta_w = tl.log(tl.maximum(ratio, 1.0)) / K_W_VAL
     z_w     = tl.where(delta_w > 0.0, _safe_expm1(delta_w), 1.0)
 
@@ -262,7 +261,7 @@ def _luma_reduce_grid_kernel(
     tl.store(new_grid_ptr + 4, w_min)
     tl.store(new_grid_ptr + 5, delta_w)
     tl.store(new_grid_ptr + 6, z_w)
-    tl.store(new_grid_ptr + 7, 1.0 / two_eps)  # w_max
+    tl.store(new_grid_ptr + 7, 1.0 / eps)  # w_max
 
 
 # =====================================================================
@@ -305,7 +304,7 @@ def _luma_requantize_kernel(
     grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     m, v = _decode_states(q_m_ptr, q_w_ptr, delta_m_old, delta_w_old, w_min_old, eps, offsets, mask)
     m_new = beta1 * m + (1.0 - beta1) * grad
-    v_new = tl.maximum(beta2 * v + (1.0 - beta2) * grad * grad, eps * eps)
+    v_new = beta2 * v + (1.0 - beta2) * grad * grad
 
     _quantize_mv(m_new, v_new, q_m_ptr, q_w_ptr,
                  delta_m_new, z_m_new, w_min_new, delta_w_new, z_w_new, w_max,
@@ -331,7 +330,7 @@ def _luma_init_update_kernel(
     grad  = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     m_new = (1.0 - beta1) * grad
-    v_new = tl.maximum((1.0 - beta2) * grad * grad, eps * eps)
+    v_new = (1.0 - beta2) * grad * grad
 
     bc1 = 1.0 - beta1
     bc2 = 1.0 - beta2
@@ -379,7 +378,7 @@ def _luma_init_quantize_kernel(
     # Recompute m/v from grad
     grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     m_new = (1.0 - beta1) * grad
-    v_new = tl.maximum((1.0 - beta2) * grad * grad, eps * eps)
+    v_new = (1.0 - beta2) * grad * grad
 
     _quantize_mv(m_new, v_new, q_m_ptr, q_w_ptr,
                  delta_m_new, z_m_new, w_min_new, delta_w_new, z_w_new, w_max,

@@ -82,7 +82,7 @@ def _precompute(
     delta_m = math.log1p(S_m) / K_M
     z_m = math.expm1(delta_m)
 
-    ratio = 1.0 / (2.0 * eps * w_min)
+    ratio = 1.0 / (eps * w_min)
     if ratio > 1.0:
         delta_w = math.log(ratio) / K_W
     else:
@@ -160,8 +160,8 @@ def _quantize_preconditioner(
     out: Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    w = 1.0 / (v.sqrt() + eps)
-    w_max = 1.0 / (2.0 * eps)
+    w = 1.0 / (v.clamp_min(0).sqrt() + eps)
+    w_max = 1.0 / eps
     w_clip = w.clamp(w_min, w_max)
     if delta_w > 0.0:
         y = torch.log(w_clip / w_min) / delta_w
@@ -202,7 +202,7 @@ def luma_init_step(
 
     # ── raw EMA from zero-init ──────────────────────────────────────────
     m = (1.0 - beta1) * grad_fp32
-    v = ((1.0 - beta2) * grad_fp32.square()).clamp(min=eps * eps)
+    v = (1.0 - beta2) * grad_fp32.square()
     del grad_fp32
 
     # ── bias-corrected parameter update  (step = 1) ────────────────────
@@ -216,7 +216,7 @@ def luma_init_step(
     # ── seed delayed scales (single CPU-GPU sync) ──────────────────────
     S_m_t, S_v_t = torch.stack([m.abs().max(), v.max()]).tolist()
     S_m: float = max(S_m_t, SCALE_FLOOR_M)
-    S_v: float = max(S_v_t, eps * eps)
+    S_v: float = max(S_v_t, 0.0)
 
     # ── quantise ────────────────────────────────────────────────────────
     w_min, delta_m, z_m, delta_w, z_w = _precompute(S_m, S_v, eps)
@@ -267,12 +267,12 @@ def luma_update_step(
     # ── 1. decode states (already float32) ──────────────────────────────
     m = _decode_momentum(Q_m, delta_m)
     w = _decode_preconditioner(Q_w, w_min, delta_w)
-    v = (1.0 / w - eps).square()
+    v = (1.0 / w - eps).clamp_min(0).square()
     del w
 
     # ── 2. EMA + param update (exact PyTorch AdamW) ─────────────────────
     m_new = beta1 * m + (1.0 - beta1) * grad_fp32
-    v_new = (beta2 * v + (1.0 - beta2) * grad_fp32.square()).clamp(min=eps * eps)
+    v_new = beta2 * v + (1.0 - beta2) * grad_fp32.square()
     del m, v, grad_fp32
 
     param.mul_(1.0 - weight_decay * lr)
@@ -281,7 +281,7 @@ def luma_update_step(
     # ── 3. track new scales (single CPU-GPU sync) ──────────────────────
     S_m_t, S_v_t = torch.stack([m_new.abs().max(), v_new.max()]).tolist()
     S_m_next: float = max(S_m_t, SCALE_FLOOR_M)
-    S_v_next: float = max(S_v_t, eps * eps)
+    S_v_next: float = max(S_v_t, 0.0)
 
     # ── 4. re-quantise with NEW matched scales (in-place) ───────────────
     #   Two-pass: we already know S_m_next/S_v_next, so we build the NEW
